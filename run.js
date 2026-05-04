@@ -1,14 +1,12 @@
 /**
- * run.js — Combined entry point for Railway
- * Spawns BCB bot and Scalper as independent child processes.
- * Each has its own logs, crash recovery, and state — they can't interfere.
+ * run.js — Entry point for Railway
+ * Runs the BCB-informed scalping bot every 60 seconds with auto-restart.
  */
 
 import { spawn } from "child_process";
 
 const BOTS = [
-  { name: "BCB",     file: "bot.js" },
-  { name: "SCALPER", file: "scalper.js" },
+  { name: "SCALPER", file: "bot.js" },
 ];
 
 function start(bot) {
@@ -24,13 +22,13 @@ function start(bot) {
   );
 
   proc.on("exit", (code) => {
-    console.log(`[${bot.name}] Exited (code ${code}) — restarting in 10s...`);
-    setTimeout(() => start(bot), 10_000);
+    console.log(`[${bot.name}] Exited (code ${code}) — restarting in 60s...`);
+    setTimeout(() => start(bot), 60_000);
   });
 
   proc.on("error", (err) => {
-    console.error(`[${bot.name}] Spawn error: ${err.message} — restarting in 10s...`);
-    setTimeout(() => start(bot), 10_000);
+    console.error(`[${bot.name}] Spawn error: ${err.message} — restarting in 60s...`);
+    setTimeout(() => start(bot), 60_000);
   });
 }
 
