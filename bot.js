@@ -1,57 +1,60 @@
 /**
- * BCB Strategy Bot — Full BlockchainBacker Framework
- * Based on 99-video analysis of BlockchainBacker's macro cycle model
+ * BCB-Informed Scalping Bot
+ * BlockchainBacker 4-Phase Macro Cycle × Sub-Hourly Scalping
  *
- * Phases: Capitulation → Accumulation → Markup → Distribution
- * Entry: Tranches (25% capitulation + 25% spring + 1-2% daily DCA)
- * Exit: Distribution signal scoring (reduce at 3+, aggressive at 5+)
- * Coins: XRPUSDT ($8–$10 target) + ETHUSDT ($5k–$8k target)
+ * Architecture:
+ *   Macro phase detection (BCB) → bias filter → micro scalp execution
  *
- * Every automatable BCB signal is implemented. See strategy doc for full list.
+ * Setups implemented:
+ *   1. Wyckoff Spring      — false break below support + volume spike + reversal
+ *   2. BB Mean Reversion   — price at Bollinger Band extreme + RSI confirmation
+ *   3. RSI Divergence      — 5-min price/RSI divergence → fade the move
+ *
+ * Timeframes: 5-min (setup detection) + 1-min (entry/exit)
+ * Max hold:   15 minutes per trade
+ * Paper trading mode by default.
  */
 
 import "dotenv/config";
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from "fs";
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─── Config ───────────────────────────────────────────────────────────────────
 
-const NTFY_CHANNEL   = process.env.NTFY_CHANNEL || "xrp-bot-dhruvjyot";
-const SHEET_URL      = process.env.GOOGLE_SHEET_URL ||
+const SYMBOL         = process.env.SCALP_SYMBOL       || "XRPUSDT";
+const ACCOUNT_USD    = parseFloat(process.env.ACCOUNT_USD      || "120");
+const RISK_PCT       = parseFloat(process.env.RISK_PCT         || "1.0");   // % account per trade
+const MAX_DAILY_LOSS = parseFloat(process.env.MAX_DAILY_LOSS   || "2.0");   // % account, then stop
+const MAX_TRADE_USD  = parseFloat(process.env.MAX_TRADE_USD    || "18");    // cap per trade
+const PAPER_TRADING  = process.env.PAPER_TRADING !== "false";
+const NTFY_CHANNEL   = process.env.NTFY_CHANNEL       || "xrp-bot-dhruvjyot";
+const SHEET_URL      = process.env.GOOGLE_SHEET_URL   ||
   "https://script.google.com/macros/s/AKfycbzWdRn61TrnC0M0z91wgcMnIOJ6cjhYti21xdEnyNVFV5335qtisHk-nT46ugpIAmSW/exec";
-const INR_RATE             = 83.5;
-const DOMINANCE_FILE       = "dominance-history.json";
-const ALTCOIN_MCAP_2021_ATH = 1_850_000_000_000; // ~$1.85T — breaking = parabola phase
-const PAPER_TRADING        = process.env.PAPER_TRADING !== "false";
 
-// Known meme coin symbols/name fragments (for frenzy detection)
-const MEME_COIN_TERMS = [
-  "doge","shib","pepe","wif","bonk","floki","meme","brett","popcat",
-  "neiro","turbo","bome","mog","myro","wen","slerf","cat","dog","babydoge",
-  "wojak","cope","chad","moon","safe","inu","elon","cumrocket","sponge",
-];
+// Indicator settings
+const BB_PERIOD      = 20;
+const BB_STD         = 2;
+const RSI_PERIOD     = 14;
+const ATR_PERIOD     = 14;
+const VOL_MA_PERIOD  = 20;
+const MACRO_CACHE_TTL = 60 * 60 * 1000;  // re-fetch macro every 1 hour
 
-// ─── Coin Config ──────────────────────────────────────────────────────────────
+// Files
+const POSITION_FILE  = "scalp-position.json";
+const DAILY_PNL_FILE = "scalp-daily-pnl.json";
+const MACRO_CACHE    = "macro-cache.json";
 
-const COINS = [
-  {
-    symbol: "XRPUSDT", displayName: "XRP",
-    portfolioUSD: parseFloat(process.env.XRP_PORTFOLIO_USD || "60"),
-    dailyDCAPct:  parseFloat(process.env.DAILY_DCA_PCT     || "1.5"),
-    maxPositionPct: parseFloat(process.env.MAX_POSITION_PCT || "50"),
-    targetLow: 8.0, targetHigh: 10.0,
-    cmAsset: "xrp",
-    dcaFile: "dca-state-XRPUSDT.json",
-  },
-  {
-    symbol: "ETHUSDT", displayName: "ETH",
-    portfolioUSD: parseFloat(process.env.ETH_PORTFOLIO_USD || "60"),
-    dailyDCAPct:  parseFloat(process.env.DAILY_DCA_PCT     || "1.5"),
-    maxPositionPct: parseFloat(process.env.MAX_POSITION_PCT || "50"),
-    targetLow: 5000, targetHigh: 8000,
-    cmAsset: "eth",
-    dcaFile: "dca-state-ETHUSDT.json",
-  },
-];
+// ─── File Helpers ─────────────────────────────────────────────────────────────
+
+function readJSON(file, def) {
+  try { return JSON.parse(readFileSync(file, "utf8")); }
+  catch { return def; }
+}
+function writeJSON(file, data) {
+  writeFileSync(file, JSON.stringify(data, null, 2));
+}
+function deleteFile(file) {
+  try { unlinkSync(file); } catch {}
+}
 
 // ─── Notifications ────────────────────────────────────────────────────────────
 
@@ -66,934 +69,522 @@ async function notify(title, message, priority = "default") {
 }
 
 async function logToSheet(data) {
+  if (!SHEET_URL) return;
   try {
     await fetch(SHEET_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(data),
     });
-    console.log("  📊 Logged to Google Sheet");
+    console.log("  📊 Logged to Sheet");
   } catch {}
-}
-
-// ─── External Data Sources ────────────────────────────────────────────────────
-
-// Yahoo Finance — stocks, VIX, treasury yields, copper
-async function fetchYahooFinance(symbol) {
-  try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=90d`;
-    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const result = data.chart?.result?.[0];
-    if (!result) return null;
-    const closes = result.indicators.quote[0].close.filter((v) => v !== null);
-    if (closes.length === 0) return null;
-    const current    = closes[closes.length - 1];
-    const high90d    = Math.max(...closes);
-    const low90d     = Math.min(...closes);
-    const sma20      = closes.slice(-20).reduce((a, b) => a + b, 0) / Math.min(20, closes.length);
-    const pctFromHigh = ((current - high90d) / high90d) * 100;
-    const aboveSMA20 = current > sma20;
-    return { current, high90d, low90d, sma20, pctFromHigh, aboveSMA20, closes };
-  } catch { return null; }
-}
-
-// Alternative.me — Crypto Fear & Greed Index
-async function fetchFearGreed() {
-  try {
-    const res  = await fetch("https://api.alternative.me/fng/?limit=1");
-    const data = await res.json();
-    return { value: parseInt(data.data[0].value), label: data.data[0].value_classification };
-  } catch { return null; }
-}
-
-// CoinMetrics community API — Realized Price (free, no key needed)
-// Realized Price = Realized Cap / Circulating Supply
-// If current price < realized price → most holders at a loss (BCB capitulation signal)
-async function fetchRealizedPrice(asset) {
-  try {
-    const url = `https://community-api.coinmetrics.io/v4/timeseries/asset-metrics` +
-      `?assets=${asset}&metrics=SplyCur,CapRealUSD&frequency=1d&limit_per_page=2&sort=time`;
-    const res  = await fetch(url, { headers: { Accept: "application/json" } });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const row  = data.data?.[data.data.length - 1];
-    if (!row?.CapRealUSD || !row?.SplyCur) return null;
-    return parseFloat(row.CapRealUSD) / parseFloat(row.SplyCur);
-  } catch { return null; }
-}
-
-// CoinGecko trending — detect meme coin frenzy (BCB's #1 cycle top signal)
-async function fetchMemeCoinFrenzy() {
-  try {
-    const res  = await fetch("https://api.coingecko.com/api/v3/search/trending");
-    const data = await res.json();
-    const trending = data.coins || [];
-    const memeCount = trending.filter((c) => {
-      const sym  = (c.item?.symbol || "").toLowerCase();
-      const name = (c.item?.name   || "").toLowerCase();
-      return MEME_COIN_TERMS.some((m) => sym.includes(m) || name.includes(m));
-    }).length;
-    return {
-      memeCount,
-      total:    trending.length,
-      isFrenzy: memeCount >= 3,
-      coins:    trending.map((c) => c.item?.symbol).join(", "),
-    };
-  } catch { return null; }
-}
-
-// Google Trends RSS — detect crypto going mainstream (distribution/euphoria signal)
-async function fetchGoogleTrends() {
-  try {
-    const res = await fetch(
-      "https://trends.google.com/trends/trendingsearches/daily/rss?geo=US",
-      { headers: { "User-Agent": "Mozilla/5.0" } }
-    );
-    const xml = await res.text();
-    const CRYPTO_TERMS = ["bitcoin","crypto","xrp","ethereum","ripple","btc","eth","blockchain","coinbase","binance","altcoin"];
-    const titles = [...xml.matchAll(/<title><!\[CDATA\[(.*?)\]\]><\/title>/gi)].map((m) => m[1].toLowerCase());
-    const hits  = titles.filter((t) => CRYPTO_TERMS.some((term) => t.includes(term)));
-    return { cryptoTrending: hits.length, terms: hits.slice(0, 3).join(" | "), isMainstream: hits.length >= 2 };
-  } catch { return null; }
 }
 
 // ─── Market Data ──────────────────────────────────────────────────────────────
 
-async function fetchCandles(symbol, interval, limit = 120) {
-  const map = { "1m":"1m","5m":"5m","15m":"15m","1H":"1h","4H":"4h","1D":"1d","1W":"1w","1M":"1M" };
-  const i   = map[interval] || interval;
-  const url = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${i}&limit=${limit}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Binance ${interval} error: ${res.status}`);
-  const data = await res.json();
-  return data.map((k) => ({
-    time: k[0], open: parseFloat(k[1]), high: parseFloat(k[2]),
-    low:  parseFloat(k[3]), close: parseFloat(k[4]), volume: parseFloat(k[5]),
-  }));
+async function fetchBinanceOHLCV(symbol, interval, limit = 100) {
+  try {
+    const url = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+    const res  = await fetch(url);
+    if (!res.ok) return null;
+    const raw  = await res.json();
+    return {
+      times:   raw.map(c => c[0]),
+      opens:   raw.map(c => parseFloat(c[1])),
+      highs:   raw.map(c => parseFloat(c[2])),
+      lows:    raw.map(c => parseFloat(c[3])),
+      closes:  raw.map(c => parseFloat(c[4])),
+      volumes: raw.map(c => parseFloat(c[5])),
+    };
+  } catch { return null; }
 }
 
-// ─── Indicators ───────────────────────────────────────────────────────────────
-
-function calcEMA(closes, period) {
-  if (closes.length < period) return null;
-  const k = 2 / (period + 1);
-  let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < closes.length; i++) ema = closes[i] * k + ema * (1 - k);
-  return ema;
+async function fetchYahooBar(symbol) {
+  try {
+    const url  = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=90d`;
+    const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0", Accept: "application/json" } });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const r    = data.chart?.result?.[0];
+    if (!r) return null;
+    const closes = r.indicators.quote[0].close.filter(v => v !== null);
+    return { current: closes.at(-1), closes, high90d: Math.max(...closes), low90d: Math.min(...closes) };
+  } catch { return null; }
 }
 
-function calcSMA(closes, period) {
-  if (closes.length < period) return null;
-  return closes.slice(-period).reduce((a, b) => a + b, 0) / period;
+async function fetchCoinGeckoDominance() {
+  try {
+    const res  = await fetch("https://api.coingecko.com/api/v3/global");
+    const data = await res.json();
+    return data.data?.market_cap_percentage?.btc ?? null;
+  } catch { return null; }
 }
+
+async function fetchFearGreed() {
+  try {
+    const res  = await fetch("https://api.alternative.me/fng/?limit=1");
+    const data = await res.json();
+    return parseInt(data.data[0].value);
+  } catch { return null; }
+}
+
+// ─── Technical Indicators ─────────────────────────────────────────────────────
 
 function calcRSI(closes, period = 14) {
   if (closes.length < period + 1) return null;
   let gains = 0, losses = 0;
-  for (let i = closes.length - period; i < closes.length; i++) {
-    const diff = closes[i] - closes[i - 1];
-    if (diff > 0) gains += diff; else losses -= diff;
+  for (let i = 1; i <= period; i++) {
+    const d = closes[i] - closes[i - 1];
+    if (d > 0) gains += d; else losses -= d;
   }
-  const avgGain = gains / period, avgLoss = losses / period;
-  if (avgLoss === 0) return 100;
-  if (avgGain === 0) return 0;
-  return 100 - 100 / (1 + avgGain / avgLoss);
-}
-
-function calcStochRSI(closes, rsiPeriod = 14, stochPeriod = 14) {
-  if (closes.length < rsiPeriod + stochPeriod + 1) return null;
-  const rsiSeries = [];
-  for (let i = rsiPeriod; i < closes.length; i++) {
-    const r = calcRSI(closes.slice(i - rsiPeriod, i + 1), rsiPeriod);
-    if (r !== null) rsiSeries.push(r);
+  let avgG = gains / period, avgL = losses / period;
+  for (let i = period + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    avgG = (avgG * (period - 1) + (d > 0 ? d : 0)) / period;
+    avgL = (avgL * (period - 1) + (d < 0 ? -d : 0)) / period;
   }
-  if (rsiSeries.length < stochPeriod) return null;
-  const win     = rsiSeries.slice(-stochPeriod);
-  const current = win[win.length - 1];
-  const lowest  = Math.min(...win), highest = Math.max(...win);
-  if (highest === lowest) return current > 50 ? 100 : 0;
-  return ((current - lowest) / (highest - lowest)) * 100;
+  if (avgL === 0) return 100;
+  return 100 - 100 / (1 + avgG / avgL);
 }
 
-function detectBearishDivergence(weeklyCandles, weeklyCloses) {
-  if (weeklyCandles.length < 10) return false;
-  const recentCloses = weeklyCloses.slice(-10);
-  const priceHighIdx = recentCloses.indexOf(Math.max(...recentCloses));
-  const prevHigh = Math.max(...recentCloses.slice(0, priceHighIdx));
-  if (recentCloses[priceHighIdx] <= prevHigh) return false;
-  const rsiNow  = calcRSI(recentCloses, Math.min(5, recentCloses.length - 1));
-  const rsiPrev = calcRSI(recentCloses.slice(0, -3), Math.min(5, recentCloses.length - 4));
-  if (rsiNow === null || rsiPrev === null) return false;
-  return rsiNow < rsiPrev * 0.95;
-}
-
-function detectCapitulationCandle(candles) {
-  if (candles.length < 5) return false;
-  const avgVol = candles.slice(-20).reduce((s, c) => s + c.volume, 0) / Math.min(20, candles.length);
-  return candles.slice(-3).some((c) => {
-    const body = Math.abs(c.close - c.open), range = c.high - c.low;
-    return c.volume > avgVol * 2.5 && range > 0 && body / range > 0.5;
-  });
-}
-
-function detectSpring(dailyCandles) {
-  if (dailyCandles.length < 35) return false;
-  const priorLow = Math.min(...dailyCandles.slice(-35, -5).map((c) => c.low));
-  return dailyCandles.slice(-5).some((c) => c.low < priorLow * 0.995 && c.close > priorLow);
-}
-
-function detectParabola(dailyCandles) {
-  if (dailyCandles.length < 11) return false;
-  const tenDaysAgo = dailyCandles[dailyCandles.length - 11].close;
-  const current    = dailyCandles[dailyCandles.length - 1].close;
-  return (current - tenDaysAgo) / tenDaysAgo * 100 > 100;
-}
-
-function detectWyckoffPhase(weeklyCandles) {
-  if (weeklyCandles.length < 20) return "UNKNOWN";
-  const closes = weeklyCandles.map((c) => c.close);
-  const current = closes[closes.length - 1];
-  const low52w  = Math.min(...closes.slice(-52));
-  const high52w = Math.max(...closes.slice(-52));
-  const pos = (current - low52w) / (high52w - low52w);
-  if (pos < 0.2) return "SPRING / ACCUMULATION LOW";
-  if (pos < 0.4) return "PHASE B (base building)";
-  if (pos < 0.6) return "SIGN OF STRENGTH";
-  if (pos < 0.8) return "MARKUP PHASE";
-  return "DISTRIBUTION ZONE";
-}
-
-// ─── BTC Dominance History ─────────────────────────────────────────────────────
-
-function loadDominanceHistory() {
-  if (!existsSync(DOMINANCE_FILE)) return [];
-  try { return JSON.parse(readFileSync(DOMINANCE_FILE, "utf8")); } catch { return []; }
-}
-
-function updateDominanceHistory(dominance) {
-  const history = loadDominanceHistory();
-  const today   = new Date().toISOString().slice(0, 10);
-  if (history.length === 0 || history[history.length - 1].date !== today) {
-    history.push({ date: today, dominance });
-    if (history.length > 200) history.shift();
-    writeFileSync(DOMINANCE_FILE, JSON.stringify(history, null, 2));
+function calcRSIArray(closes, period = 14) {
+  const out = [];
+  for (let i = period + 1; i <= closes.length; i++) {
+    out.push(calcRSI(closes.slice(0, i), period));
   }
-  return history;
+  return out;
 }
 
-function calcDominanceRSI(history) {
-  // Downsample daily → weekly, need 15+ weeks
-  const weekly = history.filter((_, i) => i % 7 === 0).map((d) => d.dominance);
-  if (weekly.length < 15) return null;
-  return calcRSI(weekly, 14);
+function calcSMA(values, period) {
+  if (values.length < period) return null;
+  return values.slice(-period).reduce((a, b) => a + b, 0) / period;
 }
 
-function isDominanceDeclining(history) {
-  if (history.length < 14) return null;
-  const recent = history.slice(-7).reduce((a, b) => a + b.dominance, 0) / 7;
-  const prior  = history.slice(-14, -7).reduce((a, b) => a + b.dominance, 0) / 7;
-  return recent < prior;
+function calcBB(closes, period = 20, numStd = 2) {
+  if (closes.length < period) return null;
+  const slice = closes.slice(-period);
+  const mid   = slice.reduce((a, b) => a + b, 0) / period;
+  const std   = Math.sqrt(slice.reduce((a, v) => a + (v - mid) ** 2, 0) / period);
+  return { upper: mid + numStd * std, mid, lower: mid - numStd * std, std };
 }
 
-// ─── BTC + Macro Data (fetched ONCE per cycle, shared across all coins) ────────
+function calcATR(highs, lows, closes, period = 14) {
+  if (closes.length < period + 1) return null;
+  const trs = [];
+  for (let i = 1; i < closes.length; i++) {
+    trs.push(Math.max(
+      highs[i] - lows[i],
+      Math.abs(highs[i] - closes[i - 1]),
+      Math.abs(lows[i]  - closes[i - 1])
+    ));
+  }
+  return trs.slice(-period).reduce((a, b) => a + b, 0) / period;
+}
 
-async function fetchBTCMacroData() {
-  console.log("\n── Fetching market data ─────────────────────────────────\n");
+function calcVolMA(volumes, period = 20) {
+  if (volumes.length < period) return null;
+  return volumes.slice(-period).reduce((a, b) => a + b, 0) / period;
+}
 
-  const [
-    btcWeekly, btcMonthly, btcDaily,
-    russell2000, dowJones, sp500, nasdaq, vix, igv,
-    treasury10y, copper,
-    fearGreed, memeFrenzy, googleTrends,
-    btcRealizedPrice,
-  ] = await Promise.all([
-    fetchCandles("BTCUSDT", "1W", 220),
-    fetchCandles("BTCUSDT", "1M", 60),
-    fetchCandles("BTCUSDT", "1D", 90),
-    fetchYahooFinance("IWM"),       // Russell 2000
-    fetchYahooFinance("%5EDJI"),    // Dow Jones
-    fetchYahooFinance("SPY"),       // S&P 500
-    fetchYahooFinance("QQQ"),       // Nasdaq 100
-    fetchYahooFinance("%5EVIX"),    // VIX
-    fetchYahooFinance("IGV"),       // Software ETF (BCB's macro trigger)
-    fetchYahooFinance("%5ETNX"),    // 10-year Treasury yield
-    fetchYahooFinance("HG%3DF"),    // Copper futures (macro stress)
+// ─── Macro Bias (BCB Phase, cached 1 hour) ────────────────────────────────────
+
+async function getMacroBias() {
+  const cache = readJSON(MACRO_CACHE, {});
+  if (cache.ts && Date.now() - cache.ts < MACRO_CACHE_TTL) {
+    console.log(`  📡 Macro (cached): Phase=${cache.phase} Bias=${cache.bias} WeeklyRSI=${cache.weeklyRSI}`);
+    return cache;
+  }
+
+  console.log("  📡 Fetching macro data...");
+  const [weeklyBTC, russell, vix, fearGreed, dominance] = await Promise.all([
+    fetchBinanceOHLCV("BTCUSDT", "1w", 120),
+    fetchYahooBar("%5ERUT"),
+    fetchYahooBar("%5EVIX"),
     fetchFearGreed(),
-    fetchMemeCoinFrenzy(),
-    fetchGoogleTrends(),
-    fetchRealizedPrice("btc"),
+    fetchCoinGeckoDominance(),
   ]);
 
-  // ── BTC Weekly ───────────────────────────────────────────────────────────────
-  const btcWeeklyCloses = btcWeekly.map((c) => c.close);
-  const btcPrice        = btcWeeklyCloses[btcWeeklyCloses.length - 1];
-  const weeklyRSI       = calcRSI(btcWeeklyCloses, 14);
-  const ma100w          = calcSMA(btcWeeklyCloses, 100);
-  const ema200w         = calcEMA(btcWeeklyCloses, 200);
-  const weeklyEMA12     = calcEMA(btcWeeklyCloses, 12);
-  const weeklyEMA26     = calcEMA(btcWeeklyCloses, 26);
-  const weeklyMACD      = weeklyEMA12 !== null && weeklyEMA26 !== null ? weeklyEMA12 - weeklyEMA26 : null;
-  const btcVsMA100      = ma100w  ? ((btcPrice - ma100w)  / ma100w)  * 100 : null;
-  const btcVsEMA200     = ema200w ? ((btcPrice - ema200w) / ema200w) * 100 : null;
-  const bearishDivergence       = detectBearishDivergence(btcWeekly, btcWeeklyCloses);
-  const weeklyCapitulationCandle = detectCapitulationCandle(btcWeekly.slice(-22));
-
-  // ── BTC Monthly ──────────────────────────────────────────────────────────────
-  const btcMonthlyCloses = btcMonthly.map((c) => c.close);
-  const monthlyRSI       = calcRSI(btcMonthlyCloses, 14);
-  const monthlyStochRSI  = calcStochRSI(btcMonthlyCloses, 14, 14);
-  const monthlyEMA12     = calcEMA(btcMonthlyCloses, 12);
-  const monthlyEMA26     = calcEMA(btcMonthlyCloses, 26);
-  const monthlyMACD      = monthlyEMA12 !== null && monthlyEMA26 !== null ? monthlyEMA12 - monthlyEMA26 : null;
-
-  // ── BTC Daily ─────────────────────────────────────────────────────────────
-  const springDetected        = detectSpring(btcDaily);
-  const dailyCapitulationCandle = detectCapitulationCandle(btcDaily.slice(-22));
-
-  // Realized price proximity
-  const btcVsRealized = btcRealizedPrice ? ((btcPrice - btcRealizedPrice) / btcRealizedPrice) * 100 : null;
-
-  // ── Dominance + Altcoin Market Cap ─────────────────────────────────────────
-  let btcDominance     = null;
-  let altcoinMarketCap = null;
-  let dominanceRSI     = null;
-  let dominanceDeclining = null;
-  try {
-    const gData     = await fetch("https://api.coingecko.com/api/v3/global").then((r) => r.json());
-    btcDominance    = gData.data?.market_cap_percentage?.btc || null;
-    const totalMcap = gData.data?.total_market_cap?.usd      || null;
-    if (totalMcap && btcDominance) altcoinMarketCap = totalMcap * (1 - btcDominance / 100);
-    if (btcDominance) {
-      const domHistory  = updateDominanceHistory(btcDominance);
-      dominanceRSI      = calcDominanceRSI(domHistory);
-      dominanceDeclining = isDominanceDeclining(domHistory);
-    }
-  } catch {}
-
-  // ── Treasury yield trend (declining = bullish for risk assets) ─────────────
-  let treasuryDeclining = null;
-  if (treasury10y && treasury10y.closes.length >= 20) {
-    const recent = treasury10y.closes.slice(-5).reduce((a, b) => a + b, 0) / 5;
-    const prior  = treasury10y.closes.slice(-20, -5).reduce((a, b) => a + b, 0) / 15;
-    treasuryDeclining = recent < prior;
+  if (!weeklyBTC) {
+    console.log("  ⚠️  Weekly BTC data unavailable — using NEUTRAL bias");
+    return { phase: "NEUTRAL", bias: "NONE", ts: Date.now() };
   }
 
-  // ── Copper volatility (extreme swing = macro stress) ───────────────────────
-  const copperStress = copper && copper.pctFromHigh < -10;
+  const weeklyRSI   = calcRSI(weeklyBTC.closes, 14);
+  const sma100w     = calcSMA(weeklyBTC.closes, 100);
+  const currentBTC  = weeklyBTC.closes.at(-1);
+  const aboveMa100w = sma100w ? currentBTC > sma100w : null;
 
-  return {
-    // BTC indicators
-    btcPrice, weeklyRSI, ma100w, ema200w, weeklyMACD,
-    btcVsMA100, btcVsEMA200, bearishDivergence, weeklyCapitulationCandle,
-    monthlyRSI, monthlyStochRSI, monthlyMACD,
-    springDetected, dailyCapitulationCandle,
-    btcRealizedPrice, btcVsRealized,
-    // Dominance
-    btcDominance, dominanceRSI, dominanceDeclining, altcoinMarketCap,
-    // Stocks
-    russell2000, dowJones, sp500, nasdaq, vix, igv,
-    // Macro
-    treasury10y, treasuryDeclining, copper, copperStress,
-    // Sentiment
-    fearGreed, memeFrenzy, googleTrends,
-  };
-}
-
-// ─── Per-Coin Phase Detection ─────────────────────────────────────────────────
-
-async function detectCoinPhase(btc, coin) {
-  const [coinWeekly, coinDaily, coinRealizedPrice] = await Promise.all([
-    fetchCandles(coin.symbol, "1W", 60),
-    fetchCandles(coin.symbol, "1D", 40),
-    fetchRealizedPrice(coin.cmAsset),
-  ]);
-
-  const coinWeeklyCloses = coinWeekly.map((c) => c.close);
-  const coinPrice        = coinWeeklyCloses[coinWeeklyCloses.length - 1];
-  const coinWeeklyRSI    = calcRSI(coinWeeklyCloses, 14);
-  const coinWyckoff      = detectWyckoffPhase(coinWeekly);
-  const coinParabola     = detectParabola(coinDaily);
-  const coinSpring       = detectSpring(coinDaily);
-  const coinVsRealized   = coinRealizedPrice
-    ? ((coinPrice - coinRealizedPrice) / coinRealizedPrice) * 100 : null;
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // ACCUMULATION SCORE  (bottom zone — BUY signals)
-  // ════════════════════════════════════════════════════════════════════════════
-  const accumSignals = [];
-  let accumScore = 0;
-
-  // 1. BTC Weekly RSI
-  if (btc.weeklyRSI !== null && btc.weeklyRSI < 30) {
-    accumSignals.push({ signal: "BTC Weekly RSI below 30 — capitulation zone (marked bottom in every cycle)", score: 2 });
-    accumScore += 2;
-  } else if (btc.weeklyRSI !== null && btc.weeklyRSI < 40) {
-    accumSignals.push({ signal: `BTC Weekly RSI ${btc.weeklyRSI.toFixed(1)} — recovery zone`, score: 1 });
-    accumScore += 1;
+  // Russell 2000: 786 Fib from 90-day high/low
+  let russellAbove786 = null;
+  if (russell) {
+    const fib786 = russell.high90d - (russell.high90d - russell.low90d) * 0.786;
+    russellAbove786 = russell.current > fib786;
   }
 
-  // 2. Monthly StochRSI
-  if (btc.monthlyStochRSI !== null && btc.monthlyStochRSI < 5) {
-    accumSignals.push({ signal: `Monthly StochRSI ${btc.monthlyStochRSI.toFixed(1)} — extreme low (BCB: hits 0 at every bottom)`, score: 2 });
-    accumScore += 2;
-  } else if (btc.monthlyStochRSI !== null && btc.monthlyStochRSI < 20) {
-    accumSignals.push({ signal: `Monthly StochRSI ${btc.monthlyStochRSI.toFixed(1)} — oversold`, score: 1 });
-    accumScore += 1;
-  }
+  const vixSpike = vix ? vix.current > 28 : false;
 
-  // 3. Monthly RSI extreme low
-  if (btc.monthlyRSI !== null && btc.monthlyRSI < 35) {
-    accumSignals.push({ signal: `Monthly RSI ${btc.monthlyRSI.toFixed(1)} — historically oversold`, score: 1 });
-    accumScore += 1;
-  }
+  let phase = "NEUTRAL";
+  let bias  = "NONE";
 
-  // 4. Capitulation candles
-  if (btc.dailyCapitulationCandle) {
-    accumSignals.push({ signal: "Daily capitulation candle — massive volume reversal (BCB's most important signal)", score: 2 });
-    accumScore += 2;
-  }
-  if (btc.weeklyCapitulationCandle) {
-    accumSignals.push({ signal: "Weekly capitulation candle detected", score: 1 });
-    accumScore += 1;
-  }
-
-  // 5. BTC near 100W MA
-  if (btc.btcVsMA100 !== null && Math.abs(btc.btcVsMA100) < 10) {
-    accumSignals.push({ signal: `BTC within 10% of 100W MA ($${btc.ma100w.toFixed(0)}) — historical buy zone`, score: 1 });
-    accumScore += 1;
-  }
-
-  // 6. BTC near 200W EMA
-  if (btc.btcVsEMA200 !== null && Math.abs(btc.btcVsEMA200) < 15) {
-    accumSignals.push({ signal: `BTC within 15% of 200W EMA ($${btc.ema200w.toFixed(0)})`, score: 1 });
-    accumScore += 1;
-  }
-
-  // 7. Weekly MACD deeply negative
-  if (btc.weeklyMACD !== null && btc.weeklyMACD < -2000) {
-    accumSignals.push({ signal: `Weekly MACD deeply negative (${btc.weeklyMACD.toFixed(0)}) — extreme pessimism`, score: 1 });
-    accumScore += 1;
-  }
-
-  // 8. BTC Spring
-  if (btc.springDetected) {
-    accumSignals.push({ signal: "BTC spring — swept below recent lows then recovered (Wyckoff spring)", score: 2 });
-    accumScore += 2;
-  }
-
-  // 9. Coin spring
-  if (coinSpring) {
-    accumSignals.push({ signal: `${coin.displayName} spring — swept lows and recovered`, score: 1 });
-    accumScore += 1;
-  }
-
-  // 10. VIX spike (every crypto low had one — BCB rule)
-  if (btc.vix && btc.vix.current > 30) {
-    accumSignals.push({ signal: `VIX ${btc.vix.current.toFixed(1)} — HIGH FEAR (BCB: every crypto low had a VIX spike)`, score: 2 });
-    accumScore += 2;
-  } else if (btc.vix && btc.vix.current > 20) {
-    accumSignals.push({ signal: `VIX ${btc.vix.current.toFixed(1)} — mildly elevated`, score: 0.5 });
-    accumScore += 0.5;
-  }
-
-  // 11. Fear & Greed extreme fear
-  if (btc.fearGreed && btc.fearGreed.value <= 25) {
-    accumSignals.push({ signal: `Fear & Greed ${btc.fearGreed.value} (${btc.fearGreed.label}) — extreme fear = buy signal`, score: 1 });
-    accumScore += 1;
-  }
-
-  // 12. Russell 2000 deep correction = macro stress
-  if (btc.russell2000 && btc.russell2000.pctFromHigh < -20) {
-    accumSignals.push({ signal: `Russell 2000 ${btc.russell2000.pctFromHigh.toFixed(1)}% from 90d high — macro stress`, score: 0.5 });
-    accumScore += 0.5;
-  }
-
-  // 13. BTC below realized price → majority of BTC holders at a loss (FREE proxy for Glassnode)
-  if (btc.btcVsRealized !== null && btc.btcVsRealized < 0) {
-    accumSignals.push({ signal: `BTC ${Math.abs(btc.btcVsRealized).toFixed(1)}% BELOW realized price ($${btc.btcRealizedPrice.toFixed(0)}) — most holders at a loss`, score: 2 });
-    accumScore += 2;
-  } else if (btc.btcVsRealized !== null && btc.btcVsRealized < 20) {
-    accumSignals.push({ signal: `BTC only ${btc.btcVsRealized.toFixed(1)}% above realized price — near breakeven for avg holder`, score: 1 });
-    accumScore += 1;
-  }
-
-  // 14. Coin below its own realized price
-  if (coinVsRealized !== null && coinVsRealized < 0) {
-    accumSignals.push({ signal: `${coin.displayName} ${Math.abs(coinVsRealized).toFixed(1)}% below realized price — most ${coin.displayName} holders at a loss`, score: 1 });
-    accumScore += 1;
-  }
-
-  // 15. Copper stress = macro fear (BCB: extreme volatility = caution/bottom signal)
-  if (btc.copperStress) {
-    accumSignals.push({ signal: `Copper ${btc.copper.pctFromHigh.toFixed(1)}% from 90d high — macro stress signal`, score: 0.5 });
-    accumScore += 0.5;
-  }
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // DISTRIBUTION SCORE  (top zone — SELL signals)
-  // ════════════════════════════════════════════════════════════════════════════
-  const distSignals = [];
-  let distScore = 0;
-
-  // 1. Weekly RSI bearish divergence
-  if (btc.bearishDivergence) {
-    distSignals.push({ signal: "Weekly RSI bearish divergence — price higher high, RSI lower high", score: 2 });
-    distScore += 2;
-  }
-
-  // 2. Weekly RSI > 70
-  if (btc.weeklyRSI !== null && btc.weeklyRSI > 70) {
-    distSignals.push({ signal: `Weekly RSI ${btc.weeklyRSI.toFixed(1)} — distribution zone`, score: 1 });
-    distScore += 1;
-  }
-
-  // 3. Weekly MACD crossing red at highs
-  if (btc.weeklyMACD !== null && btc.weeklyMACD > 0 && btc.weeklyRSI !== null && btc.weeklyRSI > 65) {
-    distSignals.push({ signal: "Weekly MACD positive + RSI high — watch for red cross (BCB's MACD distribution signal)", score: 1 });
-    distScore += 1;
-  }
-
-  // 4. Monthly MACD + monthly RSI high
-  if (btc.monthlyMACD !== null && btc.monthlyMACD > 0 && btc.monthlyRSI !== null && btc.monthlyRSI > 70) {
-    distSignals.push({ signal: "Monthly MACD positive + monthly RSI high — cycle top risk", score: 1 });
-    distScore += 1;
-  }
-
-  // 5. BTC dominance < 40% = altcoin season peak
-  if (btc.btcDominance !== null && btc.btcDominance < 40) {
-    distSignals.push({ signal: `BTC dominance ${btc.btcDominance.toFixed(1)}% — altcoin season PEAK (BCB: < 40% = near cycle top)`, score: 2 });
-    distScore += 2;
-  }
-
-  // 6. BTC dominance weekly RSI < 40 (BCB's specific distribution trigger)
-  if (btc.dominanceRSI !== null && btc.dominanceRSI < 40) {
-    distSignals.push({ signal: `BTC dominance weekly RSI ${btc.dominanceRSI.toFixed(1)} — below 40 (BCB: this is the altcoin season confirmed signal)`, score: 2 });
-    distScore += 2;
-  }
-
-  // 7. Coin 10-day parabola — BCB's #1 coin cycle top signal
-  if (coinParabola) {
-    distSignals.push({ signal: `${coin.displayName} 100%+ in 10 days — BCB's #1 cycle top signal. SELL NOW.`, score: 3 });
-    distScore += 3;
-  }
-
-  // 8. BTC overextended above 100W MA
-  if (btc.btcVsMA100 !== null && btc.btcVsMA100 > 80) {
-    distSignals.push({ signal: `BTC ${btc.btcVsMA100.toFixed(0)}% above 100W MA — historically overextended (tops at 80-100%)`, score: 1 });
-    distScore += 1;
-  }
-
-  // 9. Monthly StochRSI > 90
-  if (btc.monthlyStochRSI !== null && btc.monthlyStochRSI > 90) {
-    distSignals.push({ signal: `Monthly StochRSI ${btc.monthlyStochRSI.toFixed(1)} — extremely overbought`, score: 1 });
-    distScore += 1;
-  }
-
-  // 10. VIX extremely low = complacency
-  if (btc.vix && btc.vix.current < 14) {
-    distSignals.push({ signal: `VIX ${btc.vix.current.toFixed(1)} — extreme complacency (market not pricing in risk)`, score: 1 });
-    distScore += 1;
-  }
-
-  // 11. Fear & Greed extreme greed
-  if (btc.fearGreed && btc.fearGreed.value >= 75) {
-    distSignals.push({ signal: `Fear & Greed ${btc.fearGreed.value} (${btc.fearGreed.label}) — extreme greed = sell signal`, score: 1 });
-    distScore += 1;
-  }
-
-  // 12. IGV distributing
-  if (btc.igv && btc.igv.pctFromHigh < -15 && !btc.igv.aboveSMA20) {
-    distSignals.push({ signal: `IGV ETF ${btc.igv.pctFromHigh.toFixed(1)}% from high, below 20d MA — software sector weakening`, score: 1 });
-    distScore += 1;
-  }
-
-  // 13. Meme coin frenzy — BCB's #1 signal cycle is over
-  if (btc.memeFrenzy?.isFrenzy) {
-    distSignals.push({ signal: `🚨 MEME COIN FRENZY — ${btc.memeFrenzy.memeCount}/${btc.memeFrenzy.total} trending coins are memes (${btc.memeFrenzy.coins}) — BCB: CYCLE IS OVER`, score: 3 });
-    distScore += 3;
-  } else if (btc.memeFrenzy && btc.memeFrenzy.memeCount >= 2) {
-    distSignals.push({ signal: `${btc.memeFrenzy.memeCount} meme coins in top trending — frenzy building`, score: 1 });
-    distScore += 1;
-  }
-
-  // 14. Crypto going mainstream on Google Trends = euphoria signal
-  if (btc.googleTrends?.isMainstream) {
-    distSignals.push({ signal: `Crypto trending on Google (${btc.googleTrends.terms}) — mainstream euphoria signal`, score: 1 });
-    distScore += 1;
-  }
-
-  // 15. BTC far above realized price = euphoria (NUPL proxy)
-  if (btc.btcVsRealized !== null && btc.btcVsRealized > 100) {
-    distSignals.push({ signal: `BTC ${btc.btcVsRealized.toFixed(0)}% above realized price — extreme unrealized profit (euphoria zone)`, score: 1 });
-    distScore += 1;
-  }
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // BULL RUN CONFIRMATION  (hold / add signals)
-  // ════════════════════════════════════════════════════════════════════════════
-  const bullSignals = [];
-
-  // Dominance declining = altcoin rotation underway
-  if (btc.dominanceDeclining === true) {
-    bullSignals.push("BTC dominance declining — altcoin rotation underway (BCB: dom falling = alts about to run)");
-  }
-  if (btc.dominanceRSI !== null && btc.dominanceRSI < 50) {
-    bullSignals.push(`BTC dominance weekly RSI ${btc.dominanceRSI.toFixed(1)} — below 50, altcoin season building`);
-  }
-  if (btc.btcDominance !== null && btc.btcDominance < 50 && btc.btcDominance > 40) {
-    bullSignals.push(`BTC dominance ${btc.btcDominance.toFixed(1)}% (40-50%) — altcoin season building`);
-  }
-  if (btc.weeklyMACD !== null && btc.weeklyMACD > 0 && btc.weeklyRSI !== null && btc.weeklyRSI < 65) {
-    bullSignals.push("Weekly MACD positive + RSI not overbought — healthy markup");
-  }
-  if (btc.btcVsMA100 !== null && btc.btcVsMA100 > 10 && btc.btcVsMA100 < 50) {
-    bullSignals.push(`BTC ${btc.btcVsMA100.toFixed(0)}% above 100W MA — normal markup territory`);
-  }
-  // Russell 2000 — BCB's #1 crypto bull trigger
-  if (btc.russell2000 && btc.russell2000.pctFromHigh > -5 && btc.russell2000.aboveSMA20) {
-    bullSignals.push(`🔑 Russell 2000 near ATH (${btc.russell2000.pctFromHigh.toFixed(1)}% from 90d high) — BCB's #1 crypto bull trigger`);
-  }
-  // Dow Jones ATH
-  if (btc.dowJones && btc.dowJones.pctFromHigh > -3 && btc.dowJones.aboveSMA20) {
-    bullSignals.push(`Dow Jones near ATH (${btc.dowJones.pctFromHigh.toFixed(1)}%) — macro bullish`);
-  }
-  // S&P 500 ATH
-  if (btc.sp500 && btc.sp500.pctFromHigh > -3 && btc.sp500.aboveSMA20) {
-    bullSignals.push(`S&P 500 near ATH (${btc.sp500.pctFromHigh.toFixed(1)}%) — macro bullish`);
-  }
-  // Nasdaq ATH
-  if (btc.nasdaq && btc.nasdaq.pctFromHigh > -3 && btc.nasdaq.aboveSMA20) {
-    bullSignals.push(`Nasdaq near ATH (${btc.nasdaq.pctFromHigh.toFixed(1)}%) — tech/risk-on bullish`);
-  }
-  // IGV breaking out — BCB's direct BTC correlation signal
-  if (btc.igv && btc.igv.pctFromHigh > -5 && btc.igv.aboveSMA20) {
-    bullSignals.push(`IGV software ETF near ATH (${btc.igv.pctFromHigh.toFixed(1)}%) — BCB: BTC follows IGV with near precision`);
-  }
-  // Altcoin market cap vs 2021 ATH — parabola trigger
-  if (btc.altcoinMarketCap) {
-    if (btc.altcoinMarketCap > ALTCOIN_MCAP_2021_ATH) {
-      bullSignals.push(`🚀 ALTCOIN MCAP $${(btc.altcoinMarketCap / 1e12).toFixed(2)}T — ABOVE 2021 ATH! BCB: parabola phase activated`);
-    } else {
-      const pct = ((ALTCOIN_MCAP_2021_ATH - btc.altcoinMarketCap) / ALTCOIN_MCAP_2021_ATH * 100).toFixed(0);
-      bullSignals.push(`Altcoin mcap $${(btc.altcoinMarketCap / 1e12).toFixed(2)}T — ${pct}% below 2021 ATH ($1.85T) — break it = parabola`);
-    }
-  }
-  // Treasury yields declining = bullish for risk assets
-  if (btc.treasuryDeclining === true) {
-    bullSignals.push(`10Y Treasury yield declining — bond market easing, risk-on favorable`);
-  }
-  // Fear & Greed healthy range
-  if (btc.fearGreed && btc.fearGreed.value >= 45 && btc.fearGreed.value < 75) {
-    bullSignals.push(`Fear & Greed ${btc.fearGreed.value} (${btc.fearGreed.label}) — healthy sentiment`);
-  }
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // PHASE DETERMINATION
-  // ════════════════════════════════════════════════════════════════════════════
-  let phase;
-  if (accumScore >= 6 && btc.weeklyRSI !== null && btc.weeklyRSI < 40) {
+  // CAPITULATION — Weekly RSI < 30 + BTC near/below 100W MA or VIX spike
+  if (weeklyRSI < 30 && (aboveMa100w === false || vixSpike)) {
     phase = "CAPITULATION";
-  } else if (accumScore >= 1 && btc.weeklyRSI !== null && btc.weeklyRSI < 55) {
-    phase = "ACCUMULATION";
-  } else if (distScore >= 5 || coinParabola || btc.memeFrenzy?.isFrenzy) {
+    bias  = "BOTH";
+  }
+  // DISTRIBUTION — RSI > 70 + extreme greed
+  else if (weeklyRSI > 70 && fearGreed !== null && fearGreed > 75) {
     phase = "DISTRIBUTION";
-  } else if (distScore >= 3) {
-    phase = "LATE MARKUP";
-  } else {
+    bias  = "SHORT";
+  }
+  // MARKUP — RSI > 50 + above 100W MA + Russell above 786 Fib
+  else if (weeklyRSI > 50 && aboveMa100w && russellAbove786 !== false) {
     phase = "MARKUP";
+    bias  = "LONG";
+  }
+  // ACCUMULATION — RSI 30–55, recovering from capitulation
+  else if (weeklyRSI >= 30 && weeklyRSI <= 55 && aboveMa100w) {
+    phase = "ACCUMULATION";
+    bias  = "LONG";
   }
 
-  return {
-    phase, accumScore, distScore,
-    coinPrice, coinWeeklyRSI, coinWyckoff, coinParabola, coinSpring,
-    coinRealizedPrice, coinVsRealized,
-    accumSignals, distSignals, bullSignals,
+  const result = {
+    phase, bias,
+    weeklyRSI:      weeklyRSI?.toFixed(1),
+    currentBTC:     currentBTC?.toFixed(0),
+    sma100w:        sma100w?.toFixed(0),
+    aboveMa100w,
+    dominance:      dominance?.toFixed(1),
+    russellAbove786,
+    fearGreed,
+    vixSpike,
+    ts: Date.now(),
   };
+  writeJSON(MACRO_CACHE, result);
+  console.log(`  📡 Macro: Phase=${phase} Bias=${bias} WeeklyRSI=${weeklyRSI?.toFixed(1)} BTC=${currentBTC?.toFixed(0)} DOM=${dominance?.toFixed(1)}%`);
+  return result;
 }
 
-// ─── DCA State (per-coin) ─────────────────────────────────────────────────────
+// ─── Setup 1: Wyckoff Spring ──────────────────────────────────────────────────
+// False break below 5-min support + volume spike + immediate recovery + RSI extreme
 
-function loadDCAState(dcaFile, legacyMigrate = false) {
-  if (legacyMigrate && !existsSync(dcaFile) && existsSync("dca-state.json")) {
-    console.log("  📦 Migrating dca-state.json → " + dcaFile);
-    const legacy   = JSON.parse(readFileSync("dca-state.json", "utf8"));
-    const migrated = {
-      totalCoin:    legacy.totalCoin ?? legacy.totalXRP ?? 0,
-      totalCostUSD: legacy.totalCostUSD ?? 0,
-      avgEntryPrice: legacy.avgEntryPrice ?? 0,
-      lastDCADate:  legacy.lastDCADate ?? null,
-      tranches:     legacy.tranches ?? { tranche1Deployed: false, tranche2Deployed: false },
-      trades: (legacy.trades ?? []).map((t) => ({
-        date: t.date, price: t.price ?? t.xrpPrice ?? 0,
-        dcaUSD: t.dcaUSD ?? 0, coinQty: t.coinQty ?? t.xrpQty ?? 0,
-        phase: t.phase, type: t.type,
-      })),
+function detectSpring(m5, m1, atr) {
+  if (!atr) return null;
+  const rsi1m   = calcRSI(m1.closes, RSI_PERIOD);
+  const volMA5m = calcVolMA(m5.volumes.slice(0, -1), VOL_MA_PERIOD);
+  if (rsi1m === null || !volMA5m) return null;
+
+  const support   = Math.min(...m5.lows.slice(-21, -1));
+  const prevClose = m5.closes.at(-2);
+  const prevLow   = m5.lows.at(-2);
+  const prevVol   = m5.volumes.at(-2);
+  const price     = m1.closes.at(-1);
+
+  if (
+    prevClose < support &&          // prev 5-min closed below support (spring)
+    prevVol   > volMA5m * 2.0 &&   // volume spike ≥ 2× average
+    price     > support &&          // price has recovered above support
+    rsi1m     < 25                  // 1-min RSI deeply oversold
+  ) {
+    const swingHigh = Math.max(...m5.highs.slice(-15));
+    return {
+      setup: "WYCKOFF_SPRING",
+      direction: "LONG",
+      entry: price,
+      target: swingHigh + 0.3 * atr,
+      stop:   Math.min(prevLow, support) - 0.5 * atr,
+      maxHoldMin: 15,
+      reason: `Spring: support=${support.toFixed(5)} vol=${(prevVol / volMA5m).toFixed(1)}x RSI1m=${rsi1m.toFixed(1)}`,
     };
-    writeFileSync(dcaFile, JSON.stringify(migrated, null, 2));
-    return migrated;
   }
-  if (!existsSync(dcaFile)) {
-    return { totalCoin: 0, totalCostUSD: 0, avgEntryPrice: 0, lastDCADate: null,
-      tranches: { tranche1Deployed: false, tranche2Deployed: false }, trades: [] };
-  }
-  const raw = JSON.parse(readFileSync(dcaFile, "utf8"));
-  if (raw.totalXRP !== undefined && raw.totalCoin === undefined) { raw.totalCoin = raw.totalXRP; delete raw.totalXRP; }
-  return raw;
+  return null;
 }
 
-function saveDCAState(dcaFile, state) {
-  writeFileSync(dcaFile, JSON.stringify(state, null, 2));
-}
+// ─── Setup 2: Bollinger Band Mean Reversion ───────────────────────────────────
+// Price at 5-min BB extreme + 1-min RSI confirmation + volume
 
-// ─── Dashboard ────────────────────────────────────────────────────────────────
+function detectBBReversion(m5, m1, atr) {
+  if (!atr) return null;
+  const bb5m    = calcBB(m5.closes, BB_PERIOD, BB_STD);
+  const rsi1m   = calcRSI(m1.closes, RSI_PERIOD);
+  const volMA1m = calcVolMA(m1.volumes.slice(0, -1), VOL_MA_PERIOD);
+  if (!bb5m || rsi1m === null || !volMA1m) return null;
 
-async function generateDashboard() {
-  console.log("\n╔══════════════════════════════════════════════════════════╗");
-  console.log("║       📊 BCB STRATEGY DASHBOARD                        ║");
-  console.log("╚══════════════════════════════════════════════════════════╝\n");
-  for (const coin of COINS) {
-    const state = loadDCAState(coin.dcaFile, coin.symbol === "XRPUSDT");
-    let coinPrice = 0;
-    try { const c = await fetchCandles(coin.symbol, "1D", 2); coinPrice = c[c.length - 1].close; } catch {}
-    console.log(`\n── ${coin.displayName} (${coin.symbol}) ──────────────────────────────\n`);
-    console.log(`  Portfolio: $${coin.portfolioUSD} (₹${(coin.portfolioUSD * INR_RATE).toFixed(0)})`);
-    console.log(`  Daily DCA: ${coin.dailyDCAPct}% = $${(coin.portfolioUSD * coin.dailyDCAPct / 100).toFixed(2)}/day`);
-    console.log(`  Target:    $${coin.targetLow.toLocaleString()} – $${coin.targetHigh.toLocaleString()}`);
-    console.log(`  Mode:      ${PAPER_TRADING ? "PAPER" : "LIVE"}\n`);
-    if (state.trades.length === 0) { console.log("  No trades yet.\n"); continue; }
-    const val = state.totalCoin * coinPrice;
-    const pnl = val - state.totalCostUSD;
-    console.log(`  Total ${coin.displayName}:  ${state.totalCoin.toFixed(4)}`);
-    console.log(`  Avg Entry: $${state.avgEntryPrice.toFixed(4)}`);
-    console.log(`  Cost:      $${state.totalCostUSD.toFixed(2)} (₹${(state.totalCostUSD * INR_RATE).toFixed(0)})`);
-    if (coinPrice > 0) {
-      console.log(`  Price:     $${coinPrice.toFixed(4)}`);
-      console.log(`  Value:     $${val.toFixed(2)} (₹${(val * INR_RATE).toFixed(0)})`);
-      console.log(`  P&L:       ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} (${(pnl / state.totalCostUSD * 100).toFixed(1)}%)`);
-    }
-    const tL = state.totalCoin * coin.targetLow, tH = state.totalCoin * coin.targetHigh;
-    console.log(`  At $${coin.targetLow.toLocaleString()}: $${tL.toFixed(2)} | +${((tL / state.totalCostUSD - 1) * 100).toFixed(0)}%`);
-    console.log(`  At $${coin.targetHigh.toLocaleString()}: $${tH.toFixed(2)} | +${((tH / state.totalCostUSD - 1) * 100).toFixed(0)}%`);
-    console.log(`\n  T1 (capitulation): ${state.tranches?.tranche1Deployed ? "✅" : "⏳"}`);
-    console.log(`  T2 (spring):       ${state.tranches?.tranche2Deployed ? "✅" : "⏳"}`);
-    console.log(`  DCA buys:          ${state.trades.length}`);
-  }
-  console.log("\n══════════════════════════════════════════════════════════\n");
-}
+  const price   = m1.closes.at(-1);
+  const lastVol = m1.volumes.at(-1);
+  const volOK   = lastVol > volMA1m * 1.3;
 
-// ─── Run for a single coin ────────────────────────────────────────────────────
-
-async function runCoin(coin, btc, today, now) {
-  const state = loadDCAState(coin.dcaFile, coin.symbol === "XRPUSDT");
-
-  console.log(`\n${"─".repeat(57)}`);
-  console.log(`  ${coin.displayName} (${coin.symbol})`);
-  console.log(`${"─".repeat(57)}`);
-
-  if (state.totalCoin > 0) {
-    console.log(`\n  📦 ${state.totalCoin.toFixed(4)} ${coin.displayName} | Avg $${state.avgEntryPrice.toFixed(4)} | Cost $${state.totalCostUSD.toFixed(2)}`);
+  // LONG: price at/below lower BB + RSI oversold + volume spike
+  if (price <= bb5m.lower && rsi1m < 30 && volOK) {
+    return {
+      setup: "BB_REVERSION",
+      direction: "LONG",
+      entry:  price,
+      target: bb5m.mid,
+      stop:   bb5m.lower - 0.3 * atr,
+      maxHoldMin: 10,
+      reason: `BB lower: price=${price.toFixed(5)} lower=${bb5m.lower.toFixed(5)} RSI1m=${rsi1m.toFixed(1)}`,
+    };
   }
 
-  if (state.lastDCADate === today) {
-    console.log(`  ✅ DCA done today. Next check: tomorrow.\n`);
+  // SHORT: price at/above upper BB + RSI overbought + volume spike
+  if (price >= bb5m.upper && rsi1m > 70 && volOK) {
+    return {
+      setup: "BB_REVERSION",
+      direction: "SHORT",
+      entry:  price,
+      target: bb5m.mid,
+      stop:   bb5m.upper + 0.3 * atr,
+      maxHoldMin: 10,
+      reason: `BB upper: price=${price.toFixed(5)} upper=${bb5m.upper.toFixed(5)} RSI1m=${rsi1m.toFixed(1)}`,
+    };
+  }
+  return null;
+}
+
+// ─── Setup 3: RSI Divergence ──────────────────────────────────────────────────
+// 5-min price higher high + RSI lower high + volume decline → SHORT the fakeout
+
+function detectDivergence(m5, m1, atr, bias) {
+  if (!atr || bias !== "LONG") return null;  // only fade uptrends
+
+  const rsiArr = calcRSIArray(m5.closes, RSI_PERIOD);
+  if (rsiArr.length < 12) return null;
+
+  const lb = 6;
+  const recentHighPrice = Math.max(...m5.highs.slice(-lb));
+  const recentHighRSI   = Math.max(...rsiArr.slice(-lb));
+  const prevHighPrice   = Math.max(...m5.highs.slice(-(lb * 2), -lb));
+  const prevHighRSI     = Math.max(...rsiArr.slice(-(lb * 2), -lb));
+  const volMA5m         = calcVolMA(m5.volumes.slice(0, -1), VOL_MA_PERIOD);
+  const currentVol5m    = m5.volumes.at(-1);
+  if (!volMA5m) return null;
+
+  const price = m1.closes.at(-1);
+
+  if (
+    recentHighPrice > prevHighPrice * 1.002 &&  // price: higher high (≥ 0.2% higher)
+    recentHighRSI   < prevHighRSI - 3 &&         // RSI: lower high (≥ 3 pts divergence)
+    currentVol5m    < volMA5m * 0.85             // volume declining on new high
+  ) {
+    return {
+      setup: "RSI_DIVERGENCE",
+      direction: "SHORT",
+      entry:  price,
+      target: Math.min(...m5.lows.slice(-lb)),
+      stop:   recentHighPrice + 0.5 * atr,
+      maxHoldMin: 12,
+      reason: `Bearish div: price ${prevHighPrice.toFixed(5)}→${recentHighPrice.toFixed(5)} RSI ${prevHighRSI.toFixed(1)}→${recentHighRSI.toFixed(1)} vol ${(currentVol5m / volMA5m).toFixed(2)}x`,
+    };
+  }
+  return null;
+}
+
+// ─── Position Management ──────────────────────────────────────────────────────
+
+function loadPosition()      { return readJSON(POSITION_FILE, null); }
+function savePosition(pos)   {
+  if (pos === null) { deleteFile(POSITION_FILE); return; }
+  writeJSON(POSITION_FILE, pos);
+}
+function loadDailyPnL() {
+  const today = new Date().toISOString().slice(0, 10);
+  const data  = readJSON(DAILY_PNL_FILE, {});
+  if (data.date !== today) return { date: today, pnlUSD: 0, trades: 0, wins: 0 };
+  return data;
+}
+function saveDailyPnL(data)  { writeJSON(DAILY_PNL_FILE, data); }
+
+async function managePosition(pos, currentPrice) {
+  const ageMin = (Date.now() - pos.entryTime) / 60000;
+  const pnlPct = pos.direction === "LONG"
+    ? (currentPrice - pos.entry) / pos.entry * 100
+    : (pos.entry - currentPrice) / pos.entry * 100;
+
+  let closeReason = null;
+  if (pos.direction === "LONG") {
+    if (currentPrice >= pos.target) closeReason = "TARGET_HIT";
+    if (currentPrice <= pos.stop)   closeReason = "STOP_HIT";
+  } else {
+    if (currentPrice <= pos.target) closeReason = "TARGET_HIT";
+    if (currentPrice >= pos.stop)   closeReason = "STOP_HIT";
+  }
+  if (ageMin >= pos.maxHoldMin) closeReason = "TIME_LIMIT";
+
+  if (!closeReason) {
+    console.log(`  📌 Holding ${pos.direction} ${pos.setup} | P&L: ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(3)}% | Age: ${ageMin.toFixed(1)}min | Target: ${pos.target.toFixed(5)} | Stop: ${pos.stop.toFixed(5)}`);
+    return false;
+  }
+
+  // ── Close position ──
+  const pnlUSD = (pnlPct / 100) * pos.sizeUSD;
+  const daily  = loadDailyPnL();
+  daily.pnlUSD += pnlUSD;
+  daily.trades++;
+  if (pnlUSD > 0) daily.wins++;
+  saveDailyPnL(daily);
+  savePosition(null);
+
+  const emoji = pnlUSD > 0 ? "✅" : "❌";
+  console.log(`  ${emoji} CLOSED ${pos.direction} ${pos.setup} | ${closeReason} | P&L: ${pnlUSD >= 0 ? "+" : ""}$${pnlUSD.toFixed(3)} (${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(3)}%)`);
+  console.log(`  📅 Daily: $${daily.pnlUSD.toFixed(3)} | Trades: ${daily.trades} | Wins: ${daily.wins}/${daily.trades}`);
+
+  const tag = PAPER_TRADING ? "[PAPER] " : "";
+  await notify(
+    `${tag}Scalp ${closeReason === "TARGET_HIT" ? "✅ Win" : "❌ Loss"} — ${pos.setup}`,
+    `${pos.direction} ${SYMBOL}\n` +
+    `Entry: ${pos.entry.toFixed(5)} → Exit: ${currentPrice.toFixed(5)}\n` +
+    `P&L: ${pnlUSD >= 0 ? "+" : ""}$${pnlUSD.toFixed(3)} (${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(3)}%)\n` +
+    `Reason: ${closeReason} | Age: ${ageMin.toFixed(1)}min\n` +
+    `Daily: ${daily.pnlUSD >= 0 ? "+" : ""}$${daily.pnlUSD.toFixed(3)} | ${daily.wins}W/${daily.trades - daily.wins}L`,
+    pnlUSD > 0 ? "high" : "default"
+  );
+
+  await logToSheet({
+    Date:           new Date().toISOString().slice(0, 10),
+    Time:           new Date().toISOString().slice(11, 19),
+    Symbol:         SYMBOL,
+    Side:           pos.direction === "LONG" ? "BUY" : "SELL",
+    Setup:          pos.setup,
+    "Entry ($)":    pos.entry,
+    "Exit ($)":     currentPrice,
+    "Size ($)":     pos.sizeUSD.toFixed(2),
+    "P&L ($)":      pnlUSD.toFixed(3),
+    "P&L %":        pnlPct.toFixed(3),
+    "Close Reason": closeReason,
+    "Hold Min":     ageMin.toFixed(1),
+    Phase:          pos.phase,
+    Mode:           PAPER_TRADING ? "PAPER" : "LIVE",
+  });
+
+  return true;
+}
+
+async function openPosition(setup, macro) {
+  const { direction, entry, target, stop, maxHoldMin, reason, setup: setupName } = setup;
+
+  // ATR-based sizing: risk% of account ÷ distance to stop
+  const riskUSD  = ACCOUNT_USD * (RISK_PCT / 100);
+  const distance = Math.abs(entry - stop);
+  const units    = distance > 0 ? riskUSD / distance : 0;
+  const sizeUSD  = Math.min(units * entry, MAX_TRADE_USD);
+
+  // Enforce minimum R/R of 1.5
+  const rrRatio = Math.abs(target - entry) / Math.abs(entry - stop);
+  if (rrRatio < 1.5) {
+    console.log(`  ⚠️  ${setupName} R/R=${rrRatio.toFixed(2)} < 1.5 — skipping`);
     return;
   }
 
-  const p = await detectCoinPhase(btc, coin);
+  const pos = {
+    symbol: SYMBOL, direction,
+    setup: setupName,
+    entry, target, stop, maxHoldMin, sizeUSD,
+    entryTime: Date.now(),
+    phase: macro.phase,
+    reason,
+  };
+  savePosition(pos);
 
-  // ── Signal Report ──────────────────────────────────────────────────────────
-  console.log(`\n── BCB Signal Report — ${coin.displayName} ───────────────────────────\n`);
-  console.log(`  BTC Price:         $${btc.btcPrice.toFixed(0)}`);
-  console.log(`  100W MA:           $${btc.ma100w ? btc.ma100w.toFixed(0) : "N/A"} (BTC ${btc.btcVsMA100 !== null ? (btc.btcVsMA100 >= 0 ? "+" : "") + btc.btcVsMA100.toFixed(1) + "%" : "N/A"})`);
-  console.log(`  200W EMA:          $${btc.ema200w ? btc.ema200w.toFixed(0) : "N/A"} (BTC ${btc.btcVsEMA200 !== null ? (btc.btcVsEMA200 >= 0 ? "+" : "") + btc.btcVsEMA200.toFixed(1) + "%" : "N/A"})`);
-  console.log(`  BTC Realized:      $${btc.btcRealizedPrice ? btc.btcRealizedPrice.toFixed(0) : "N/A"} (BTC ${btc.btcVsRealized !== null ? (btc.btcVsRealized >= 0 ? "+" : "") + btc.btcVsRealized.toFixed(1) + "% vs realized)" : "N/A)"}`);
-  console.log(`  Weekly RSI(14):    ${btc.weeklyRSI !== null ? btc.weeklyRSI.toFixed(1) : "N/A"}`);
-  console.log(`  Weekly MACD:       ${btc.weeklyMACD !== null ? (btc.weeklyMACD >= 0 ? "+" : "") + btc.weeklyMACD.toFixed(0) : "N/A"}`);
-  console.log(`  Monthly RSI:       ${btc.monthlyRSI !== null ? btc.monthlyRSI.toFixed(1) : "N/A"}`);
-  console.log(`  Monthly StochRSI:  ${btc.monthlyStochRSI !== null ? btc.monthlyStochRSI.toFixed(1) : "N/A"}${btc.monthlyStochRSI !== null && btc.monthlyStochRSI < 5 ? " 🔴 EXTREME LOW" : ""}`);
-  console.log(`  Monthly MACD:      ${btc.monthlyMACD !== null ? (btc.monthlyMACD >= 0 ? "+" : "") + btc.monthlyMACD.toFixed(0) : "N/A"}`);
-  console.log(`  BTC Dominance:     ${btc.btcDominance !== null ? btc.btcDominance.toFixed(1) + "%" : "N/A"}`);
-  console.log(`  Dom RSI (weekly):  ${btc.dominanceRSI !== null ? btc.dominanceRSI.toFixed(1) + (btc.dominanceRSI < 40 ? " 🔴 <40 SELL" : btc.dominanceRSI < 50 ? " 🟡 <50 alts building" : "") : "N/A (building…)"}`);
-  console.log(`  Dom Trend:         ${btc.dominanceDeclining === null ? "N/A (need 14d data)" : btc.dominanceDeclining ? "📉 Declining" : "📈 Rising"}`);
-  console.log(`  ${coin.displayName} Price:         $${p.coinPrice.toFixed(4)}`);
-  console.log(`  ${coin.displayName} Realized:      $${p.coinRealizedPrice ? p.coinRealizedPrice.toFixed(4) : "N/A"}${p.coinVsRealized !== null ? " (" + (p.coinVsRealized >= 0 ? "+" : "") + p.coinVsRealized.toFixed(1) + "%)" : ""}`);
-  console.log(`  ${coin.displayName} Weekly RSI:    ${p.coinWeeklyRSI !== null ? p.coinWeeklyRSI.toFixed(1) : "N/A"}`);
-  console.log(`  ${coin.displayName} Wyckoff:       ${p.coinWyckoff}`);
-  console.log(`  Spring (BTC):      ${btc.springDetected ? "🟢 YES" : "No"}`);
-  console.log(`  Spring (${coin.displayName}):      ${p.coinSpring ? "🟢 YES" : "No"}`);
-  console.log(`  ${coin.displayName} Parabola:      ${p.coinParabola ? "🔴 YES — SELL SIGNAL" : "No"}`);
-  console.log(`  Bearish Div:       ${btc.bearishDivergence ? "⚠️  YES" : "No"}`);
-  console.log(`\n  ── Macro ────────────────────────────────────────────`);
-  console.log(`  VIX:               ${btc.vix ? btc.vix.current.toFixed(1) + (btc.vix.current > 30 ? " 🔴 HIGH FEAR" : btc.vix.current < 14 ? " 🟢 LOW (complacency)" : " — normal") : "N/A"}`);
-  console.log(`  Fear & Greed:      ${btc.fearGreed ? btc.fearGreed.value + " — " + btc.fearGreed.label : "N/A"}`);
-  console.log(`  Russell 2000:      ${btc.russell2000 ? "$" + btc.russell2000.current.toFixed(2) + " (" + btc.russell2000.pctFromHigh.toFixed(1) + "% from 90d high)" : "N/A"}`);
-  console.log(`  Dow Jones:         ${btc.dowJones ? "$" + btc.dowJones.current.toFixed(0) + " (" + btc.dowJones.pctFromHigh.toFixed(1) + "%)" : "N/A"}`);
-  console.log(`  S&P 500:           ${btc.sp500 ? "$" + btc.sp500.current.toFixed(2) + " (" + btc.sp500.pctFromHigh.toFixed(1) + "%)" : "N/A"}`);
-  console.log(`  Nasdaq (QQQ):      ${btc.nasdaq ? "$" + btc.nasdaq.current.toFixed(2) + " (" + btc.nasdaq.pctFromHigh.toFixed(1) + "%)" : "N/A"}`);
-  console.log(`  IGV (software):    ${btc.igv ? "$" + btc.igv.current.toFixed(2) + " (" + btc.igv.pctFromHigh.toFixed(1) + "%)" : "N/A"}`);
-  console.log(`  10Y Treasury:      ${btc.treasury10y ? btc.treasury10y.current.toFixed(2) + "%" + (btc.treasuryDeclining ? " 📉 declining" : " 📈 rising") : "N/A"}`);
-  console.log(`  Copper:            ${btc.copper ? "$" + btc.copper.current.toFixed(3) + " (" + btc.copper.pctFromHigh.toFixed(1) + "% from 90d high)" + (btc.copperStress ? " ⚠️  STRESS" : "") : "N/A"}`);
-  console.log(`  Altcoin Mcap:      ${btc.altcoinMarketCap ? "$" + (btc.altcoinMarketCap / 1e12).toFixed(2) + "T (ATH: $1.85T)" : "N/A"}`);
-  console.log(`\n  ── Sentiment ────────────────────────────────────────`);
-  console.log(`  Meme Frenzy:       ${btc.memeFrenzy ? (btc.memeFrenzy.isFrenzy ? "🚨 YES — " : "No — ") + btc.memeFrenzy.memeCount + "/" + btc.memeFrenzy.total + " trending memes (" + btc.memeFrenzy.coins + ")" : "N/A"}`);
-  console.log(`  Google Trends:     ${btc.googleTrends ? (btc.googleTrends.isMainstream ? "🚨 CRYPTO MAINSTREAM — " : "Normal — ") + btc.googleTrends.cryptoTrending + " crypto searches trending" + (btc.googleTrends.terms ? " (" + btc.googleTrends.terms + ")" : "") : "N/A"}`);
+  const tgtPct = (Math.abs(target - entry) / entry * 100).toFixed(2);
+  const stpPct = (Math.abs(stop   - entry) / entry * 100).toFixed(2);
+  const tag    = PAPER_TRADING ? "[PAPER] " : "";
 
-  console.log(`\n  📊 Accumulation Score: ${p.accumScore}/10`);
-  p.accumSignals.forEach((s) => console.log(`    ✅ ${s.signal} (+${s.score})`));
-  console.log(`\n  📊 Distribution Score: ${p.distScore}/10`);
-  p.distSignals.forEach((s) => console.log(`    ⚠️  ${s.signal} (+${s.score})`));
-  if (p.bullSignals.length > 0) {
-    console.log(`\n  📊 Bull Run Confirmation:`);
-    p.bullSignals.forEach((s) => console.log(`    🟢 ${s}`));
-  }
-  console.log(`\n  🎯 PHASE: ${p.phase}`);
-  console.log("\n── Entry Decision ───────────────────────────────────────\n");
+  console.log(`  🚀 ENTER ${direction} via ${setupName} @ ${entry.toFixed(5)}`);
+  console.log(`     Target: ${target.toFixed(5)} (+${tgtPct}%) | Stop: ${stop.toFixed(5)} (-${stpPct}%) | R/R: ${rrRatio.toFixed(2)} | Size: $${sizeUSD.toFixed(2)}`);
+  console.log(`     Reason: ${reason}`);
 
-  const maxPositionUSD  = coin.portfolioUSD * (coin.maxPositionPct / 100);
-  const remainingCap    = maxPositionUSD - state.totalCostUSD;
-  const dailyDCAAmount  = coin.portfolioUSD * coin.dailyDCAPct / 100;
-
-  // ── DISTRIBUTION ──────────────────────────────────────────────────────────
-  if (p.phase === "DISTRIBUTION" || p.phase === "LATE MARKUP") {
-    console.log(`  🚫 ${p.phase} — no new buys.`);
-    let sellPct = 0;
-    if (p.distScore >= 5 || p.coinParabola || btc.memeFrenzy?.isFrenzy) {
-      sellPct = 75;
-      console.log(`  🔴 URGENT: ${p.distScore} dist signals — reduce 75%!`);
-    } else if (p.distScore >= 3) {
-      sellPct = 25;
-      console.log(`  ⚠️  ${p.distScore} dist signals — reduce 25%.`);
-    }
-    if (sellPct > 0 && state.totalCoin > 0) {
-      const sellCoin     = state.totalCoin * (sellPct / 100);
-      const sellValueUSD = sellCoin * p.coinPrice;
-      const pnlUSD       = (p.coinPrice - state.avgEntryPrice) * sellCoin;
-      console.log(`\n  📋 REDUCE: Sell ${sellCoin.toFixed(4)} ${coin.displayName} @ $${p.coinPrice.toFixed(4)}`);
-      console.log(`  Value: $${sellValueUSD.toFixed(2)} (₹${(sellValueUSD * INR_RATE).toFixed(0)})`);
-      console.log(`  P&L:   ${pnlUSD >= 0 ? "+" : ""}$${pnlUSD.toFixed(2)}`);
-      await notify(
-        `🔴 BCB SELL — ${coin.symbol} — ${p.distScore} SIGNALS`,
-        `Reduce ${sellPct}% of ${coin.displayName}!\nSell ${sellCoin.toFixed(4)} @ $${p.coinPrice.toFixed(4)}\nValue: $${sellValueUSD.toFixed(2)} (₹${(sellValueUSD * INR_RATE).toFixed(0)})\nP&L: ${pnlUSD >= 0 ? "+" : ""}$${pnlUSD.toFixed(2)}\n\n${p.distSignals.map((s) => s.signal).join("\n")}`,
-        p.distScore >= 5 ? "urgent" : "high"
-      );
-    }
-    state.lastDCADate = today;
-    saveDCAState(coin.dcaFile, state);
-    return;
-  }
-
-  // ── Max position ──────────────────────────────────────────────────────────
-  if (remainingCap <= 0) {
-    console.log(`  ℹ️  Max position reached — holding.`);
-    state.lastDCADate = today;
-    saveDCAState(coin.dcaFile, state);
-    return;
-  }
-
-  let executed = false;
-
-  // ── TRANCHE 1 — 25% at capitulation (score ≥ 8) ──────────────────────────
-  if (p.accumScore >= 8 && !state.tranches?.tranche1Deployed) {
-    const amt = Math.min(coin.portfolioUSD * 0.25, remainingCap);
-    const qty = amt / p.coinPrice;
-    console.log(`  🚀 TRANCHE 1 — Capitulation entry (score: ${p.accumScore}/10)`);
-    console.log(`     Buy $${amt.toFixed(2)} = ${qty.toFixed(4)} ${coin.displayName} @ $${p.coinPrice.toFixed(4)}`);
-    state.totalCoin += qty; state.totalCostUSD += amt;
-    state.avgEntryPrice = state.totalCostUSD / state.totalCoin;
-    if (!state.tranches) state.tranches = {};
-    state.tranches.tranche1Deployed = true; state.lastDCADate = today;
-    state.trades.push({ date: today, price: p.coinPrice, dcaUSD: amt, coinQty: qty, phase: p.phase, type: "TRANCHE 1 (25%)" });
-    await notify(`🚀 ${coin.displayName} T1 — CAPITULATION`, `Score: ${p.accumScore}/10\n${qty.toFixed(4)} ${coin.displayName} @ $${p.coinPrice.toFixed(4)}\n$${amt.toFixed(2)} (₹${(amt * INR_RATE).toFixed(0)})\nTarget: $${coin.targetLow}–$${coin.targetHigh}`, "high");
-    await logToSheet({ timestamp: now.toISOString(), symbol: coin.symbol, side: "BUY", price: p.coinPrice, tradeSize: amt, pnlPct: null, pnlINR: null, exitReason: `TRANCHE 1 | Score: ${p.accumScore}`, mode: PAPER_TRADING ? "PAPER" : "LIVE", rsi3: btc.weeklyRSI, vwap: btc.monthlyStochRSI, ema8: btc.btcDominance || 0 });
-    executed = true;
-  }
-
-  // ── TRANCHE 2 — 25% at spring ─────────────────────────────────────────────
-  if ((btc.springDetected || p.coinSpring) && !state.tranches?.tranche2Deployed && !executed) {
-    const amt = Math.min(coin.portfolioUSD * 0.25, remainingCap);
-    const qty = amt / p.coinPrice;
-    console.log(`  🌱 TRANCHE 2 — Spring detected`);
-    console.log(`     Buy $${amt.toFixed(2)} = ${qty.toFixed(4)} ${coin.displayName} @ $${p.coinPrice.toFixed(4)}`);
-    state.totalCoin += qty; state.totalCostUSD += amt;
-    state.avgEntryPrice = state.totalCostUSD / state.totalCoin;
-    if (!state.tranches) state.tranches = {};
-    state.tranches.tranche2Deployed = true; state.lastDCADate = today;
-    state.trades.push({ date: today, price: p.coinPrice, dcaUSD: amt, coinQty: qty, phase: p.phase, type: "TRANCHE 2 (25% spring)" });
-    await notify(`🌱 ${coin.displayName} T2 — SPRING`, `${qty.toFixed(4)} ${coin.displayName} @ $${p.coinPrice.toFixed(4)}\n$${amt.toFixed(2)} (₹${(amt * INR_RATE).toFixed(0)})`, "high");
-    await logToSheet({ timestamp: now.toISOString(), symbol: coin.symbol, side: "BUY", price: p.coinPrice, tradeSize: amt, pnlPct: null, pnlINR: null, exitReason: "TRANCHE 2 — Spring", mode: PAPER_TRADING ? "PAPER" : "LIVE", rsi3: btc.weeklyRSI, vwap: btc.monthlyStochRSI, ema8: btc.btcDominance || 0 });
-    executed = true;
-  }
-
-  // ── DAILY DCA ─────────────────────────────────────────────────────────────
-  if (!executed) {
-    const amt = Math.min(dailyDCAAmount, remainingCap);
-    if (amt < 0.5) {
-      console.log("  ℹ️  DCA amount too small — position near max.");
-    } else {
-      const qty = amt / p.coinPrice;
-      console.log(`  📈 DAILY DCA — ${coin.dailyDCAPct}% of portfolio`);
-      console.log(`     Buy $${amt.toFixed(2)} = ${qty.toFixed(4)} ${coin.displayName} @ $${p.coinPrice.toFixed(4)}`);
-      state.totalCoin += qty; state.totalCostUSD += amt;
-      state.avgEntryPrice = state.totalCostUSD / state.totalCoin;
-      state.lastDCADate = today;
-      state.trades.push({ date: today, price: p.coinPrice, dcaUSD: amt, coinQty: qty, phase: p.phase, type: "DCA" });
-      const tL = state.totalCoin * coin.targetLow, tH = state.totalCoin * coin.targetHigh;
-      console.log(`\n  Total ${coin.displayName}:  ${state.totalCoin.toFixed(4)}`);
-      console.log(`  Avg Entry: $${state.avgEntryPrice.toFixed(4)}`);
-      console.log(`  P&L:       ${(state.totalCoin * p.coinPrice - state.totalCostUSD) >= 0 ? "+" : ""}$${(state.totalCoin * p.coinPrice - state.totalCostUSD).toFixed(2)}`);
-      console.log(`  At $${coin.targetLow.toLocaleString()}: $${tL.toFixed(2)} (₹${(tL * INR_RATE).toFixed(0)}) | +${((tL / state.totalCostUSD - 1) * 100).toFixed(0)}%`);
-      console.log(`  At $${coin.targetHigh.toLocaleString()}: $${tH.toFixed(2)} (₹${(tH * INR_RATE).toFixed(0)}) | +${((tH / state.totalCostUSD - 1) * 100).toFixed(0)}%`);
-      await notify(`📈 DCA — ${coin.symbol}`, `${qty.toFixed(4)} ${coin.displayName} @ $${p.coinPrice.toFixed(4)}\nPhase: ${p.phase}\nTotal: ${state.totalCoin.toFixed(4)} ${coin.displayName}\nAvg: $${state.avgEntryPrice.toFixed(4)}\nAt $${coin.targetLow.toLocaleString()}: $${tL.toFixed(2)} (₹${(tL * INR_RATE).toFixed(0)})`, "default");
-      await logToSheet({ timestamp: now.toISOString(), symbol: coin.symbol, side: "BUY", price: p.coinPrice, tradeSize: amt, pnlPct: null, pnlINR: null, exitReason: `DCA — ${p.phase} | RSI:${btc.weeklyRSI?.toFixed(0)} StochRSI:${btc.monthlyStochRSI?.toFixed(0)} Dom:${btc.btcDominance?.toFixed(1)}%`, mode: PAPER_TRADING ? "PAPER" : "LIVE", rsi3: btc.weeklyRSI, vwap: btc.monthlyStochRSI, ema8: btc.btcDominance || 0 });
-    }
-  }
-
-  saveDCAState(coin.dcaFile, state);
+  await notify(
+    `${tag}New Scalp — ${setupName} ${direction}`,
+    `${direction} ${SYMBOL} @ ${entry.toFixed(5)}\n` +
+    `Target: ${target.toFixed(5)} (+${tgtPct}%)\n` +
+    `Stop:   ${stop.toFixed(5)} (-${stpPct}%)\n` +
+    `R/R: ${rrRatio.toFixed(2)} | Size: $${sizeUSD.toFixed(2)}\n` +
+    `Phase: ${macro.phase}`,
+    "high"
+  );
 }
 
-// ─── Main Loop ────────────────────────────────────────────────────────────────
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function run() {
-  const now   = new Date();
-  const today = now.toISOString().slice(0, 10);
-  if (!existsSync(".env")) console.log("☁️  Cloud — Railway");
+  const timeStr = new Date().toISOString().replace("T", " ").slice(0, 19);
+  console.log(`\n⚡ BCB Scalper — ${timeStr} UTC [${PAPER_TRADING ? "PAPER" : "LIVE"}]`);
 
-  console.log("═══════════════════════════════════════════════════════════");
-  console.log("  BCB Strategy Bot — XRP + ETH");
-  console.log(`  ${now.toISOString()}`);
-  console.log(`  Mode: ${PAPER_TRADING ? "📋 PAPER" : "🔴 LIVE"}`);
-  console.log("═══════════════════════════════════════════════════════════");
+  // 1. Daily loss guard
+  const daily    = loadDailyPnL();
+  const lossLimit = ACCOUNT_USD * (MAX_DAILY_LOSS / 100);
+  if (daily.pnlUSD <= -lossLimit) {
+    console.log(`  🛑 Daily loss limit hit ($${daily.pnlUSD.toFixed(2)}). No new trades today.`);
+    return;
+  }
+  console.log(`  📅 Daily: ${daily.pnlUSD >= 0 ? "+" : ""}$${daily.pnlUSD.toFixed(3)} | Trades: ${daily.trades} | Wins: ${daily.wins}`);
 
-  const anyPending = COINS.some((c) => loadDCAState(c.dcaFile, c.symbol === "XRPUSDT").lastDCADate !== today);
-  if (!anyPending) {
-    console.log("  ✅ All coins DCA done today. Next check: tomorrow.\n");
-    console.log("═══════════════════════════════════════════════════════════\n");
+  // 2. Macro bias (cached hourly)
+  const macro = await getMacroBias();
+  if (macro.phase === "NEUTRAL" || macro.bias === "NONE") {
+    console.log("  ⏸️  No clear macro phase — waiting.");
     return;
   }
 
-  // Fetch BTC + macro ONCE, share across all coins
-  const btc = await fetchBTCMacroData();
-
-  for (const coin of COINS) {
-    try { await runCoin(coin, btc, today, now); }
-    catch (err) { console.error(`  ❌ ${coin.symbol} error: ${err.message}`); }
+  // 3. Accumulation phase: max 2 scalps/day
+  if (macro.phase === "ACCUMULATION" && daily.trades >= 2) {
+    console.log("  ⏸️  Accumulation phase: 2-trade daily limit reached. Patience.");
+    return;
   }
 
-  console.log("\n═══════════════════════════════════════════════════════════\n");
+  // 4. Fetch 5-min + 1-min candles
+  const [m5, m1] = await Promise.all([
+    fetchBinanceOHLCV(SYMBOL, "5m", 100),
+    fetchBinanceOHLCV(SYMBOL, "1m", 100),
+  ]);
+  if (!m5 || !m1) { console.log("  ⚠️  Market data unavailable."); return; }
+
+  const price  = m1.closes.at(-1);
+  const atr5m  = calcATR(m5.highs, m5.lows, m5.closes, ATR_PERIOD);
+  const rsi1m  = calcRSI(m1.closes, RSI_PERIOD);
+  const bb5m   = calcBB(m5.closes, BB_PERIOD, BB_STD);
+
+  console.log(`  💹 ${SYMBOL} @ $${price.toFixed(5)} | ATR5m: ${atr5m?.toFixed(5)} | RSI1m: ${rsi1m?.toFixed(1)}`);
+  if (bb5m) {
+    const pos = price < bb5m.lower ? "BELOW ↓" : price > bb5m.upper ? "ABOVE ↑" : "inside";
+    console.log(`  📐 BB5m: ${bb5m.lower.toFixed(5)} / ${bb5m.mid.toFixed(5)} / ${bb5m.upper.toFixed(5)} [${pos}]`);
+  }
+
+  // 5. Manage any open position
+  const openPos = loadPosition();
+  if (openPos) {
+    await managePosition(openPos, price);
+    return;  // one position at a time
+  }
+
+  // 6. Scan setups, filtered by macro bias
+  const canLong  = macro.bias === "LONG"  || macro.bias === "BOTH";
+  const canShort = macro.bias === "SHORT" || macro.bias === "BOTH";
+
+  const candidates = [
+    detectSpring(m5, m1, atr5m),
+    detectBBReversion(m5, m1, atr5m),
+    detectDivergence(m5, m1, atr5m, macro.bias),
+  ]
+    .filter(Boolean)
+    .filter(s =>
+      (s.direction === "LONG"  && canLong) ||
+      (s.direction === "SHORT" && canShort)
+    );
+
+  if (candidates.length === 0) {
+    const bbStatus = bb5m
+      ? (price < bb5m.lower ? "at lower" : price > bb5m.upper ? "at upper" : `inside (${((price - bb5m.lower) / (bb5m.upper - bb5m.lower) * 100).toFixed(0)}%)`)
+      : "n/a";
+    console.log(`  💤 No setups. Bias=${macro.bias} RSI1m=${rsi1m?.toFixed(1)} BB: ${bbStatus}`);
+    return;
+  }
+
+  console.log(`  🎯 ${candidates.length} setup(s): ${candidates.map(s => `${s.setup}(${s.direction})`).join(", ")}`);
+  await openPosition(candidates[0], macro);
 }
 
-// ─── Entry Point ──────────────────────────────────────────────────────────────
-
-if (process.argv.includes("--summary")) {
-  generateDashboard().catch(console.error);
-} else {
-  (async () => {
-    while (true) {
-      try { await run(); } catch (err) { console.error("Bot error:", err.message); }
-      console.log("⏳ Waiting 60 seconds...\n");
-      await new Promise((r) => setTimeout(r, 60_000));
-    }
-  })();
-}
+run().catch(e => {
+  console.error("❌ Fatal:", e.message);
+  process.exit(1);
+});
