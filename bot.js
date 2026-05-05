@@ -46,11 +46,13 @@ const MIN_RR        = 2.0;             // strategy doc: 1:2 minimum
 // Best hours UTC: 1-4 AM (crypto vol), 8-11 AM (US open), 18-20 PM (Asian liq)
 const BEST_HOURS    = [[1,4],[8,11],[18,20]];
 
-const POSITION_FILE = "scalp-position.json";
-const DAILY_FILE    = "scalp-daily-pnl.json";
-const MACRO_FILE    = "macro-cache.json";
-const FLUSH_FILE    = "flush-state.json";
-const DOM_FILE      = "dominance-history.json";
+const POSITION_FILE  = "scalp-position.json";
+const POSITION2_FILE = "scalp-position2.json";  // scale-in second contract
+const DAILY_FILE     = "scalp-daily-pnl.json";
+const MACRO_FILE     = "macro-cache.json";
+const FLUSH_FILE     = "flush-state.json";
+const DOM_FILE       = "dominance-history.json";
+const CAP_FILE       = "cap-state.json";         // capitulation flip tracking
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -542,11 +544,151 @@ function detectDivergence(m5, m1, atr5m, phase) {
   return null;
 }
 
+// ─── Capitulation Flip Logic ──────────────────────────────────────────────────
+// Strategy: "Short the dump on first volume spike, cover and flip long on reversal volume"
+// We track the capitulation dump candle, then flip to long when reversal volume appears
+
+function detectCapitulationFlip(m1, atr5m) {
+  if (!atr5m) return null;
+  const capState = readJSON(CAP_FILE, {});
+  const now      = Date.now();
+  const price    = m1.closes.at(-1);
+  const vma1m    = volmaVal(m1.volumes.slice(0,-1), VOL_MA);
+  const lastVol  = m1.volumes.at(-1);
+  const rsi1m    = rsiVal(m1.closes, RSI_PERIOD);
+  if (!vma1m || rsi1m===null) return null;
+
+  const movePct  = (price - m1.closes.at(-2)) / m1.closes.at(-2) * 100;
+  const volSpike = lastVol > vma1m * 3;
+
+  // Step 1: Detect the dump (first volume spike down)
+  if (!capState.dumpTs && movePct < -1.5 && volSpike && rsi1m < 25) {
+    writeJSON(CAP_FILE, { dumpTs: now, dumpLow: price, dumpRSI: rsi1m });
+    console.log(`  🔴 Cap dump detected @ ${price.toFixed(5)} — waiting for reversal`);
+    // Return SHORT immediately on the dump
+    return {
+      setup:"CAP_FLIP_SHORT", direction:"SHORT",
+      entry: price,
+      target: price - atr5m,
+      stop:   price + atr5m,
+      maxHoldMin: 5,
+      reason: `Cap dump: ${movePct.toFixed(2)}% vol=${(lastVol/vma1m).toFixed(1)}x RSI=${rsi1m.toFixed(1)}`,
+    };
+  }
+
+  // Step 2: After dump, detect reversal volume → flip LONG
+  if (capState.dumpTs && now - capState.dumpTs > 60*1000 && now - capState.dumpTs < 2*60*60*1000) {
+    const recovered = price > capState.dumpLow * 1.005;  // price up 0.5% from dump low
+    const buyVolume = lastVol > vma1m * 2;
+    const rsiRecovering = rsi1m > (capState.dumpRSI || 20) + 5;
+
+    if (recovered && buyVolume && rsiRecovering) {
+      delFile(CAP_FILE);
+      return {
+        setup:"CAP_FLIP_LONG", direction:"LONG",
+        entry: price,
+        target: price + 1.5 * atr5m,
+        stop:   capState.dumpLow - 0.3 * atr5m,
+        maxHoldMin: 15,
+        reason: `Cap flip LONG: dump=${capState.dumpLow?.toFixed(5)} recovery vol=${(lastVol/vma1m).toFixed(1)}x RSI=${rsi1m.toFixed(1)}`,
+      };
+    }
+  }
+
+  // Expire cap state after 2 hours
+  if (capState.dumpTs && now - capState.dumpTs > 2*60*60*1000) {
+    delFile(CAP_FILE);
+    console.log("  ⏰ Cap flip state expired");
+  }
+  return null;
+}
+
+// ─── Scale-In Logic ───────────────────────────────────────────────────────────
+// Strategy: "If target hit → close 50%, let 50% run. If price pulls back → add 2nd contract"
+// Add 2nd contract when price pulls back to entry after partial exit
+
+async function checkScaleIn(pos, price, atr5m, macro) {
+  const pos2 = loadPos2();
+  if (pos2) {
+    // Manage 2nd position same way as first
+    await managePosition2(pos2, price);
+    return;
+  }
+
+  // Only scale in if: first position is scaled (took 50% profit) + price pulls back to entry
+  if (!pos.scaled) return;
+  if (pos.direction !== "LONG") return;  // scale-in only for longs per strategy doc
+
+  const pullbackLevel = pos.entry * 1.001;  // pulled back to near entry
+  const vma1m = volmaVal ? null : null;      // we'll use ATR proximity check
+
+  const nearEntry = Math.abs(price - pos.entry) / pos.entry < 0.003;  // within 0.3% of entry
+  if (!nearEntry) return;
+
+  // Add 2nd contract at this pullback
+  const riskUSD  = ACCOUNT_USD * (RISK_PCT/100);
+  const dist     = Math.abs(pos.entry - pos.stop);
+  const sizeUSD2 = Math.min(dist>0 ? riskUSD/dist*price : 0, MAX_TRADE_USD);
+
+  const pos2Data = {
+    symbol: SYMBOL, direction: pos.direction,
+    setup: pos.setup + "_SCALE",
+    entry: price,
+    target: pos.target,
+    stop:   pos.stop,
+    maxHoldMin: pos.maxHoldMin,
+    sizeUSD: sizeUSD2,
+    entryTime: Date.now(),
+    phase: macro.phase,
+    confluence: pos.confluence,
+    reason: `Scale-in at pullback to ${price.toFixed(5)} (original entry ${pos.entry.toFixed(5)})`,
+    scaled: false,
+  };
+  savePos2(pos2Data);
+  console.log(`  ➕ SCALE-IN 2nd contract @ ${price.toFixed(5)} $${sizeUSD2.toFixed(2)}`);
+  await notify("[PAPER] Scale-In 2nd Contract",
+    `Added 2nd position @ ${price.toFixed(5)}\nSame target/stop as first trade\nPhase: ${macro.phase}`, "default");
+}
+
+async function managePosition2(pos, price) {
+  const ageMin = (Date.now()-pos.entryTime)/60000;
+  const pnlPct = pos.direction==="LONG"
+    ? (price-pos.entry)/pos.entry*100
+    : (pos.entry-price)/pos.entry*100;
+
+  let closeReason=null;
+  if (pos.direction==="LONG") {
+    if (price>=pos.target) closeReason="TARGET_HIT";
+    if (price<=pos.stop)   closeReason="STOP_HIT";
+  } else {
+    if (price<=pos.target) closeReason="TARGET_HIT";
+    if (price>=pos.stop)   closeReason="STOP_HIT";
+  }
+  if (ageMin>=pos.maxHoldMin) closeReason="TIME_LIMIT";
+  if (!closeReason) return;
+
+  const pnlUSD = (pnlPct/100)*pos.sizeUSD;
+  const daily  = loadDaily();
+  daily.pnlUSD+=pnlUSD; daily.trades++; if(pnlUSD>0) daily.wins++;
+  saveDaily(daily); savePos2(null);
+  console.log(`  ${pnlUSD>0?"✅":"❌"} CLOSED 2nd contract ${pos.direction} | ${closeReason} | ${pnlUSD>=0?"+":""}$${pnlUSD.toFixed(3)}`);
+  await logToSheet({
+    Date:new Date().toISOString().slice(0,10), Time:new Date().toISOString().slice(11,19),
+    Symbol:SYMBOL, Side:pos.direction==="LONG"?"BUY":"SELL", Setup:pos.setup,
+    "Entry ($)":pos.entry, "Exit ($)":price, "Size ($)":pos.sizeUSD.toFixed(2),
+    "P&L ($)":pnlUSD.toFixed(3), "P&L %":pnlPct.toFixed(3),
+    "Close Reason":closeReason, "Hold Min":ageMin.toFixed(1),
+    Phase:pos.phase, Confluence:"scale-in", Mode:PAPER_TRADING?"PAPER":"LIVE",
+  });
+}
+
 // ─── Position Management ──────────────────────────────────────────────────────
 
-const loadPos   = () => readJSON(POSITION_FILE,null);
-const savePos   = p => p===null ? delFile(POSITION_FILE) : writeJSON(POSITION_FILE,p);
-const loadDaily = () => {
+const loadPos    = ()  => readJSON(POSITION_FILE,null);
+const savePos    = p   => p===null ? delFile(POSITION_FILE) : writeJSON(POSITION_FILE,p);
+const loadPos2   = ()  => readJSON(POSITION2_FILE,null);
+const savePos2   = p   => p===null ? delFile(POSITION2_FILE) : writeJSON(POSITION2_FILE,p);
+const loadDaily  = () => {
   const today=new Date().toISOString().slice(0,10);
   const d=readJSON(DAILY_FILE,{});
   return d.date===today ? d : {date:today,pnlUSD:0,trades:0,wins:0};
@@ -704,9 +846,13 @@ async function run() {
     console.log(`  📐 BB5m: ${bb5m.lower.toFixed(5)}/${bb5m.mid.toFixed(5)}/${bb5m.upper.toFixed(5)} [${loc}]`);
   }
 
-  // 6. Manage open position first
+  // 6. Manage open position(s) first
   const openPos=loadPos();
-  if (openPos) { await managePosition(openPos,price); return; }
+  if (openPos) {
+    await managePosition(openPos, price);
+    await checkScaleIn(openPos, price, atr5m, macro);  // scale-in 2nd contract if eligible
+    return;
+  }
 
   // 7. Scan setups, filter by bias
   const canL = macro.bias==="LONG" ||macro.bias==="BOTH";
@@ -718,6 +864,8 @@ async function run() {
     detectVolumeLiquidation(m5,m1,atr5m),
     detectSentimentFlush(m1,atr5m,macro),
     detectDivergence(m5,m1,atr5m,macro.phase),
+    // Capitulation flip — only in CAPITULATION phase
+    macro.phase==="CAPITULATION" ? detectCapitulationFlip(m1,atr5m) : null,
   ]
     .filter(Boolean)
     .filter(s=>(s.direction==="LONG"&&canL)||(s.direction==="SHORT"&&canS));
