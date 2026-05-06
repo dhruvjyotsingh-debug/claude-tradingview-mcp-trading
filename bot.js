@@ -1,22 +1,30 @@
 /**
- * BCB-Informed Scalping Bot — ALL 5 SETUPS, ALL PARAMETERS
- * BlockchainBacker 4-Phase Macro Cycle × Sub-Hourly Scalping
+ * VWAP Scalping Bot — 7-Condition System
+ * Symbol: XRPUSDT | Timeframe: 1m | Paper Trading
  *
- * Every rule from the strategy doc is implemented:
- *   - MARKUP: weekly RSI>50 + BTC above 100W MA + Russell 786 Fib + dominance declining + altcoin mcap
- *   - DISTRIBUTION: 3-of-5 scoring (RSI div, dom RSI<40, meme frenzy, sentiment, Russell rejecting)
- *   - CAPITULATION: RSI<30 + BTC near 100W MA + VIX spike
- *   - ACCUMULATION: RSI 30-50, max 2 trades/day
- *   - Setup 1: Wyckoff Spring — RSI<15 + reversal buy volume + 0.5ATR stop + R/R 1:2.5
- *   - Setup 2: BB Reversion — entry on RSI BOUNCE (above 30 / below 70), not just at extreme
- *   - Setup 3: Volume Profile Liquidation — 3× vol spike + RSI<20/>80 + 0.1% stop-entry
- *   - Setup 4: Sentiment Flush — 1.5%+ move + 30s wait + RSI extreme + macro bias must agree
- *   - Setup 5: RSI Divergence — works in MARKUP + CAPITULATION (not DISTRIBUTION)
- *   - R/R minimum: 1:2.0 (strategy doc requirement)
- *   - Partial scale-out: close 50% at first target, trail rest
- *   - Distribution: max 2 trades/day (scalp small)
- *   - Multi-timeframe RSI confluence: 1-min + 5-min + 15-min
- *   - Trading hours: 1-4 AM, 8-11 AM, 18-20 PM UTC only
+ * LONG  (all 7 must be true):
+ *   1. Price > VWAP
+ *   2. Price > EMA(8) on 1m
+ *   3. RSI(3) < 30  (oversold pullback into trend)
+ *   4. Price within 1.5% of VWAP  (not overextended)
+ *   5. Price > PDL  (above previous day low)
+ *   6. Price < PDH  (below previous day high — room to run)
+ *   7. BTC > EMA(50) daily  (macro bull bias)
+ *
+ * SHORT (all 7 must be true):
+ *   1. Price < VWAP
+ *   2. Price < EMA(8) on 1m
+ *   3. RSI(3) > 70  (overbought push into trend)
+ *   4. Price within 1.5% of VWAP
+ *   5. Price < PDH
+ *   6. Price > PDL
+ *   7. BTC < EMA(50) daily
+ *
+ * Exit:
+ *   - Stop:    0.5 × ATR(14) from entry
+ *   - Target:  1.0 × ATR(14) from entry  →  R:R = 1:2
+ *   - Partial: 50% closed at half-target, stop moved to breakeven
+ *   - Time:    15 min max hold — no overnight
  */
 
 import "dotenv/config";
@@ -25,869 +33,384 @@ import { readFileSync, writeFileSync, unlinkSync } from "fs";
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const SYMBOL         = process.env.SCALP_SYMBOL    || "XRPUSDT";
+const BTC_SYMBOL     = "BTCUSDT";
 const ACCOUNT_USD    = parseFloat(process.env.ACCOUNT_USD    || "120");
-const RISK_PCT       = parseFloat(process.env.RISK_PCT       || "1.0");   // % per trade
-const MAX_DAILY_LOSS = parseFloat(process.env.MAX_DAILY_LOSS || "2.0");   // % stop day
-const MAX_TRADE_USD  = parseFloat(process.env.MAX_TRADE_USD  || "18");    // hard cap
-const MAX_TRADES_DAY = parseInt(process.env.MAX_TRADES_DAY   || "8");
-const PAPER_TRADING  = process.env.PAPER_TRADING !== "false";
-const NTFY_CHANNEL   = process.env.NTFY_CHANNEL   || "xrp-bot-dhruvjyot";
+const RISK_PCT       = parseFloat(process.env.RISK_PCT       || "1.0");   // % of account per trade
+const MAX_TRADE_USD  = parseFloat(process.env.MAX_TRADE_USD  || "18");    // hard cap per trade
+const MAX_TRADES_DAY = parseInt(process.env.MAX_TRADES_DAY   || "5");
+const MAX_DAILY_LOSS = parseFloat(process.env.MAX_DAILY_LOSS || "3.0");   // % of account
+const PAPER          = process.env.PAPER_TRADING !== "false";
+const NTFY           = process.env.NTFY_CHANNEL   || "xrp-bot-dhruvjyot";
 const SHEET_URL      = process.env.GOOGLE_SHEET_URL ||
   "https://script.google.com/macros/s/AKfycbzWdRn61TrnC0M0z91wgcMnIOJ6cjhYti21xdEnyNVFV5335qtisHk-nT46ugpIAmSW/exec";
 
-const BB_PERIOD     = 20;
-const BB_STD        = 2;
-const RSI_PERIOD    = 14;
-const ATR_PERIOD    = 14;
-const VOL_MA        = 20;
-const MACRO_TTL     = 60 * 60 * 1000;  // 1 hour
-const MIN_RR        = 2.0;             // strategy doc: 1:2 minimum
+const MIN_RR         = 2.0;     // minimum risk:reward ratio
+const MAX_HOLD_MIN   = 15;      // time stop in minutes
+const VWAP_BAND      = 0.015;   // 1.5% max distance from VWAP
 
-// Best hours UTC: 1-4 AM (crypto vol), 8-11 AM (US open), 18-20 PM (Asian liq)
-const BEST_HOURS    = [[1,4],[8,11],[18,20]];
+const POS_FILE   = "scalp-position.json";
+const DAILY_FILE = "scalp-daily-pnl.json";
 
-const POSITION_FILE  = "scalp-position.json";
-const POSITION2_FILE = "scalp-position2.json";  // scale-in second contract
-const DAILY_FILE     = "scalp-daily-pnl.json";
-const MACRO_FILE     = "macro-cache.json";
-const FLUSH_FILE     = "flush-state.json";
-const DOM_FILE       = "dominance-history.json";
-const CAP_FILE       = "cap-state.json";         // capitulation flip tracking
+// ─── File Helpers ─────────────────────────────────────────────────────────────
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+const readJSON  = (f, d) => { try { return JSON.parse(readFileSync(f, "utf8")); } catch { return d; } };
+const writeJSON = (f, d) => writeFileSync(f, JSON.stringify(d, null, 2));
+const delFile   = (f)    => { try { unlinkSync(f); } catch {} };
 
-const readJSON  = (f,d) => { try { return JSON.parse(readFileSync(f,"utf8")); } catch { return d; } };
-const writeJSON = (f,d) => writeFileSync(f, JSON.stringify(d,null,2));
-const delFile   = (f)   => { try { unlinkSync(f); } catch {} };
-const isGoodHour = ()   => { const h=new Date().getUTCHours(); return BEST_HOURS.some(([a,b])=>h>=a&&h<b); };
-const clamp     = (v,lo,hi) => Math.min(Math.max(v,lo),hi);
+// ─── Math / Indicators ────────────────────────────────────────────────────────
+
+function ema(arr, period) {
+  if (!arr || arr.length < period) return null;
+  const k = 2 / (period + 1);
+  let e = arr.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < arr.length; i++) e = arr[i] * k + e * (1 - k);
+  return e;
+}
+
+// RSI with period 3 — fast, designed for scalping
+function rsi(closes, p = 3) {
+  if (!closes || closes.length < p + 1) return null;
+  let g = 0, l = 0;
+  for (let i = 1; i <= p; i++) {
+    const d = closes[i] - closes[i - 1];
+    d > 0 ? (g += d) : (l -= d);
+  }
+  let ag = g / p, al = l / p;
+  for (let i = p + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    ag = (ag * (p - 1) + (d > 0 ? d : 0)) / p;
+    al = (al * (p - 1) + (d < 0 ? -d : 0)) / p;
+  }
+  return al === 0 ? 100 : 100 - 100 / (1 + ag / al);
+}
+
+function atr(highs, lows, closes, p = 14) {
+  if (!closes || closes.length < p + 1) return null;
+  const trs = [];
+  for (let i = 1; i < closes.length; i++)
+    trs.push(Math.max(
+      highs[i] - lows[i],
+      Math.abs(highs[i] - closes[i - 1]),
+      Math.abs(lows[i] - closes[i - 1])
+    ));
+  return trs.slice(-p).reduce((a, b) => a + b, 0) / p;
+}
+
+// VWAP resets at midnight UTC — filters bars to today only
+function calcVWAP(candles) {
+  const midnight = new Date();
+  midnight.setUTCHours(0, 0, 0, 0);
+  const start = midnight.getTime();
+  let cumPV = 0, cumV = 0;
+  for (let i = 0; i < candles.times.length; i++) {
+    if (candles.times[i] < start) continue;
+    const tp = (candles.highs[i] + candles.lows[i] + candles.closes[i]) / 3;
+    cumPV += tp * candles.volumes[i];
+    cumV  += candles.volumes[i];
+  }
+  return cumV > 0 ? cumPV / cumV : null;
+}
+
+// ─── Market Data ──────────────────────────────────────────────────────────────
+
+async function fetchOHLCV(symbol, interval, limit = 200) {
+  try {
+    const r = await fetch(
+      `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
+    );
+    if (!r.ok) return null;
+    const raw = await r.json();
+    return {
+      times:   raw.map(c => c[0]),
+      opens:   raw.map(c => parseFloat(c[1])),
+      highs:   raw.map(c => parseFloat(c[2])),
+      lows:    raw.map(c => parseFloat(c[3])),
+      closes:  raw.map(c => parseFloat(c[4])),
+      volumes: raw.map(c => parseFloat(c[5])),
+    };
+  } catch { return null; }
+}
 
 // ─── Notifications ────────────────────────────────────────────────────────────
 
-async function notify(title, body, priority="default") {
+async function notify(title, body, priority = "default") {
   try {
-    await fetch(`https://ntfy.sh/${NTFY_CHANNEL}`,{
-      method:"POST", headers:{Title:title,Priority:priority,Tags:"chart_increasing"}, body
+    await fetch(`https://ntfy.sh/${NTFY}`, {
+      method: "POST",
+      headers: { Title: title, Priority: priority, Tags: "chart_increasing" },
+      body,
     });
   } catch {}
 }
 
 async function logToSheet(row) {
   if (!SHEET_URL) return;
-  try { await fetch(SHEET_URL,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(row)}); } catch {}
-}
-
-// ─── Market Data ──────────────────────────────────────────────────────────────
-
-async function fetchOHLCV(symbol, interval, limit=100) {
   try {
-    const res = await fetch(`https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
-    if (!res.ok) return null;
-    const raw = await res.json();
-    return {
-      times:   raw.map(c=>c[0]),
-      opens:   raw.map(c=>parseFloat(c[1])),
-      highs:   raw.map(c=>parseFloat(c[2])),
-      lows:    raw.map(c=>parseFloat(c[3])),
-      closes:  raw.map(c=>parseFloat(c[4])),
-      volumes: raw.map(c=>parseFloat(c[5])),
-    };
-  } catch { return null; }
+    await fetch(SHEET_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(row),
+    });
+  } catch {}
 }
 
-async function fetchYahoo(sym) {
-  try {
-    const res = await fetch(
-      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=90d`,
-      { headers:{"User-Agent":"Mozilla/5.0",Accept:"application/json"} }
-    );
-    if (!res.ok) return null;
-    const data = await res.json();
-    const r    = data.chart?.result?.[0]; if (!r) return null;
-    const c    = r.indicators.quote[0].close.filter(v=>v!==null);
-    return { current:c.at(-1), closes:c, high:Math.max(...c), low:Math.min(...c) };
-  } catch { return null; }
+// ─── Daily P&L ────────────────────────────────────────────────────────────────
+
+function loadDaily() {
+  const today = new Date().toISOString().slice(0, 10);
+  const d = readJSON(DAILY_FILE, {});
+  return d.date === today ? d : { date: today, pnlUSD: 0, trades: 0, wins: 0 };
 }
+const saveDaily = d => writeJSON(DAILY_FILE, d);
 
-async function fetchDominance() {
-  try {
-    const res  = await fetch("https://api.coingecko.com/api/v3/global");
-    const data = await res.json();
-    return data.data?.market_cap_percentage?.btc ?? null;
-  } catch { return null; }
-}
+// ─── Position ────────────────────────────────────────────────────────────────
 
-async function fetchFearGreed() {
-  try {
-    const res  = await fetch("https://api.alternative.me/fng/?limit=1");
-    const data = await res.json();
-    return parseInt(data.data[0].value);
-  } catch { return null; }
-}
+const loadPos = ()  => readJSON(POS_FILE, null);
+const savePos = (p) => writeJSON(POS_FILE, p);
 
-async function fetchAltcoinMcap() {
-  try {
-    const res  = await fetch("https://api.coingecko.com/api/v3/global");
-    const data = await res.json();
-    const total = data.data?.total_market_cap?.usd ?? 0;
-    const btcMcap = data.data?.market_cap_percentage?.btc ?? 50;
-    return total * (1 - btcMcap/100);  // altcoin mcap = total minus BTC share
-  } catch { return null; }
-}
+// ─── Entry Signal ─────────────────────────────────────────────────────────────
 
-async function fetchMemeFrenzy() {
-  try {
-    const MEME_TERMS = ["doge","shib","pepe","wif","bonk","floki","meme","brett","popcat","neiro","turbo","bome","mog","wen","slerf","babydoge","wojak"];
-    const res  = await fetch("https://api.coingecko.com/api/v3/search/trending");
-    const data = await res.json();
-    const trending = (data.coins||[]).slice(0,7).map(c=>c.item?.symbol?.toLowerCase()||"");
-    return trending.filter(s=>MEME_TERMS.some(t=>s.includes(t))).length >= 3;
-  } catch { return false; }
-}
-
-// ─── Dominance RSI (weekly) — needed for Distribution scoring ─────────────────
-
-function updateDominanceHistory(dom) {
-  if (!dom) return;
-  const today = new Date().toISOString().slice(0,10);
-  const hist  = readJSON(DOM_FILE, []);
-  if (!hist.find(h=>h.date===today)) {
-    hist.push({ date:today, dom });
-    writeJSON(DOM_FILE, hist.slice(-100));
-  }
-}
-
-function calcDominanceRSI() {
-  const hist = readJSON(DOM_FILE, []);
-  if (hist.length < 16) return null;
-  const weekly = hist.filter((_,i)=>i%7===0).map(h=>h.dom);
-  if (weekly.length < 15) return null;
-  return calcRSI_raw(weekly, 14);
-}
-
-function calcRSI_raw(closes, p=14) {
-  if (closes.length < p+1) return null;
-  let g=0,l=0;
-  for (let i=1;i<=p;i++){const d=closes[i]-closes[i-1];d>0?g+=d:l-=d;}
-  let ag=g/p,al=l/p;
-  for (let i=p+1;i<closes.length;i++){
-    const d=closes[i]-closes[i-1];
-    ag=(ag*(p-1)+(d>0?d:0))/p; al=(al*(p-1)+(d<0?-d:0))/p;
-  }
-  return al===0?100:100-100/(1+ag/al);
-}
-
-// ─── Indicators ───────────────────────────────────────────────────────────────
-
-function rsiVal(closes, p=14) { return calcRSI_raw(closes, p); }
-
-function rsiArr(closes, p=14) {
-  const out=[];
-  for (let i=p+1;i<=closes.length;i++) out.push(rsiVal(closes.slice(0,i),p));
-  return out;
-}
-
-function smaVal(vals,p) {
-  if (vals.length<p) return null;
-  return vals.slice(-p).reduce((a,b)=>a+b,0)/p;
-}
-
-function bbVal(closes,p=20,n=2) {
-  if (closes.length<p) return null;
-  const sl=closes.slice(-p), mid=sl.reduce((a,b)=>a+b,0)/p;
-  const std=Math.sqrt(sl.reduce((a,v)=>a+(v-mid)**2,0)/p);
-  return {upper:mid+n*std,mid,lower:mid-n*std,std};
-}
-
-function atrVal(highs,lows,closes,p=14) {
-  if (closes.length<p+1) return null;
-  const trs=[];
-  for (let i=1;i<closes.length;i++)
-    trs.push(Math.max(highs[i]-lows[i],Math.abs(highs[i]-closes[i-1]),Math.abs(lows[i]-closes[i-1])));
-  return trs.slice(-p).reduce((a,b)=>a+b,0)/p;
-}
-
-function volmaVal(vols,p=20) {
-  if (vols.length<p) return null;
-  return vols.slice(-p).reduce((a,b)=>a+b,0)/p;
-}
-
-// Multi-timeframe confluence: 1m+5m+15m RSI all confirming direction
-function confluence(r1,r5,r15,dir) {
-  let s=0;
-  if (dir==="LONG")  { if(r1<30)s++; if(r5<35)s++; if(r15&&r15<40)s++; }
-  else               { if(r1>70)s++; if(r5>65)s++; if(r15&&r15>60)s++; }
-  return s;
-}
-
-// ─── Macro Bias ───────────────────────────────────────────────────────────────
-
-async function getMacro() {
-  const cache = readJSON(MACRO_FILE,{});
-  if (cache.ts && Date.now()-cache.ts<MACRO_TTL) {
-    console.log(`  📡 Macro(cached): ${cache.phase} Bias=${cache.bias} RSI=${cache.weeklyRSI}`);
-    return cache;
-  }
-  console.log("  📡 Fetching macro...");
-  const [wBTC, russell, vix, fg, dom, altMcap, memeFrenzy] = await Promise.all([
-    fetchOHLCV("BTCUSDT","1w",120), fetchYahoo("%5ERUT"), fetchYahoo("%5EVIX"),
-    fetchFearGreed(), fetchDominance(), fetchAltcoinMcap(), fetchMemeFrenzy(),
-  ]);
-  if (!wBTC) return {phase:"NEUTRAL",bias:"NONE",ts:Date.now()};
-
-  const weeklyRSI = rsiVal(wBTC.closes,14);
-  const ma100w    = smaVal(wBTC.closes,100);
-  const btcNow    = wBTC.closes.at(-1);
-  const aboveMA   = ma100w ? btcNow>ma100w : null;
-
-  updateDominanceHistory(dom);
-  const domRSI    = calcDominanceRSI();  // weekly dominance RSI
-  const domWeak   = domRSI !== null && domRSI < 40;
-
-  // Dominance declining week-over-week (compare last 2 weekly closes)
-  const domHist   = readJSON(DOM_FILE,[]);
-  const domDeclining = domHist.length>=8 &&
-    domHist.at(-1).dom < domHist.at(-8).dom;  // lower than 1 week ago
-
-  // Russell 786 Fib
-  let russ786=null, russRejecting=null;
-  if (russell) {
-    const fib=russell.high-(russell.high-russell.low)*0.786;
-    russ786     = russell.current>fib;
-    // Rejecting from resistance = near high but recent decline
-    const r20   = russell.closes.slice(-20);
-    russRejecting = russell.current < r20.at(-5) * 0.99 && russell.current > fib;
-  }
-
-  // Altcoin market cap: $1.85T was 2021 ATH — above = parabola territory
-  const ALT_ATH = 1_850_000_000_000;
-  const altAboveATH = altMcap && altMcap > ALT_ATH;
-
-  // Weekly RSI trend (rising = last 3 weeks increasing)
-  const weeklyRSIArr = rsiArr(wBTC.closes,14);
-  const rsiRising    = weeklyRSIArr.length>=4 &&
-    weeklyRSIArr.at(-1) > weeklyRSIArr.at(-4);
-
-  // Bearish divergence: price up but RSI down over 4 weeks
-  const bearDiv = weeklyRSIArr.length>=4 &&
-    wBTC.closes.at(-1)>wBTC.closes.at(-4) &&
-    weeklyRSIArr.at(-1)<weeklyRSIArr.at(-4)-3;
-
-  const vixSpike = vix ? vix.current>28 : false;
-
-  // ── DISTRIBUTION: 3+ of 5 signals (strategy doc requirement) ──
-  let distribScore = 0;
-  if (bearDiv)          distribScore++;   // 1. Weekly RSI bearish divergence
-  if (domWeak)          distribScore++;   // 2. Dominance RSI < 40 and weakening
-  if (memeFrenzy)       distribScore++;   // 3. Meme coins parabolic
-  if (fg !== null && fg > 80) distribScore++; // 4. Extreme greed (crowd sentiment)
-  if (russRejecting)    distribScore++;   // 5. Russell rejecting from resistance
-
-  let phase="NEUTRAL", bias="NONE";
-
-  // CAPITULATION first (most clear signal)
-  if (weeklyRSI<30 && (aboveMA===false||vixSpike)) {
-    phase="CAPITULATION"; bias="BOTH";
-  }
-  // DISTRIBUTION: 3+ signals
-  else if (distribScore>=3) {
-    phase="DISTRIBUTION"; bias="SHORT";
-  }
-  // MARKUP: ALL conditions met
-  else if (weeklyRSI>50 && rsiRising && aboveMA && russ786!==false && domDeclining) {
-    phase="MARKUP"; bias="LONG";
-  }
-  // MARKUP (relaxed): 3 of 5 markup conditions
-  else if (weeklyRSI>50 && aboveMA && russ786!==false) {
-    phase="MARKUP"; bias="LONG";
-  }
-  // ACCUMULATION
-  else if (weeklyRSI>=30 && weeklyRSI<=55 && aboveMA) {
-    phase="ACCUMULATION"; bias="LONG";
-  }
-
-  const result = {
-    phase, bias,
-    weeklyRSI: weeklyRSI?.toFixed(1), rsiRising,
-    btcNow: btcNow?.toFixed(0), ma100w: ma100w?.toFixed(0), aboveMA,
-    dom: dom?.toFixed(1), domRSI: domRSI?.toFixed(1), domDeclining, domWeak,
-    russ786, russRejecting,
-    altMcap: altMcap ? (altMcap/1e12).toFixed(2)+"T" : null, altAboveATH,
-    memeFrenzy, fearGreed: fg,
-    vixSpike, distribScore, bearDiv,
-    ts: Date.now(),
-  };
-  writeJSON(MACRO_FILE, result);
-  console.log(`  📡 Macro: ${phase} Bias=${bias} RSI=${weeklyRSI?.toFixed(1)} distribScore=${distribScore}/5 DOM=${dom?.toFixed(1)}%`);
-  return result;
-}
-
-// ─── Setup 1: Wyckoff Spring ──────────────────────────────────────────────────
-// RSI MUST be < 15 (strategy doc), reversal candle must have buy volume
-
-function detectSpring(m5, m1, atr5m) {
-  if (!atr5m) return null;
-  const rsi1m  = rsiVal(m1.closes, RSI_PERIOD);
-  const vma5m  = volmaVal(m5.volumes.slice(0,-1), VOL_MA);
-  if (rsi1m===null||!vma5m) return null;
-
-  const support   = Math.min(...m5.lows.slice(-21,-1));
-  const prevClose = m5.closes.at(-2);
-  const prevLow   = m5.lows.at(-2);
-  const prevVol   = m5.volumes.at(-2);  // volume on spring candle
-  const currVol   = m5.volumes.at(-1);  // volume on reversal candle
-  const price     = m1.closes.at(-1);
-
-  if (
-    prevClose < support &&          // spring candle closed below support
-    prevVol > vma5m * 2.0 &&        // massive sell volume on spring
-    currVol >= prevVol * 0.8 &&     // reversal candle has equal/higher buy volume
-    price > support &&              // recovered above support
-    rsi1m < 15                      // ← strategy says < 15, not < 25
-  ) {
-    const swingHigh = Math.max(...m5.highs.slice(-15));
-    return {
-      setup:"WYCKOFF_SPRING", direction:"LONG",
-      entry: price,
-      target: swingHigh + 0.3*atr5m,           // target 1: spring high + 0.3 ATR
-      target2: Math.max(...m5.highs.slice(-30)), // target 2: prior swing high
-      stop:   Math.min(prevLow,support) - 0.5*atr5m,
-      maxHoldMin: 15,
-      reason: `Spring: support=${support.toFixed(5)} sellVol=${(prevVol/vma5m).toFixed(1)}x buyVol=${(currVol/vma5m).toFixed(1)}x RSI1m=${rsi1m.toFixed(1)}`,
-    };
-  }
-  return null;
-}
-
-// ─── Setup 2: BB Mean Reversion ───────────────────────────────────────────────
-// Entry on RSI BOUNCE (above 30 for long / below 70 for short), not just at extreme
-
-function detectBBReversion(m5, m1, atr5m) {
-  if (!atr5m) return null;
-  const bb5m  = bbVal(m5.closes, BB_PERIOD, BB_STD);
-  const rsi1m = rsiVal(m1.closes, RSI_PERIOD);
-  // Need at least 2 recent 1-min RSI values to detect the bounce
-  const rsi1mPrev = rsiVal(m1.closes.slice(0,-1), RSI_PERIOD);
-  const vma1m = volmaVal(m1.volumes.slice(0,-1), VOL_MA);
-  if (!bb5m||rsi1m===null||rsi1mPrev===null||!vma1m) return null;
-
-  const price = m1.closes.at(-1);
-  const volOK = m1.volumes.at(-1) > vma1m*1.3;
-
-  // LONG: price at/below lower BB + RSI was below 25 + now bouncing back above 30
-  const rsiBounceUp = rsi1mPrev < 25 && rsi1m > 30;
-  if (price<=bb5m.lower*1.002 && rsiBounceUp && volOK) {
-    return {
-      setup:"BB_REVERSION", direction:"LONG",
-      entry:price, target:bb5m.mid,
-      stop: bb5m.lower - 0.3*atr5m, maxHoldMin:10,
-      reason:`BB long: price=${price.toFixed(5)} RSI bounce ${rsi1mPrev.toFixed(1)}→${rsi1m.toFixed(1)} (was<25, now>30)`,
-    };
-  }
-
-  // SHORT: price at/above upper BB + RSI was above 75 + now dropping below 70
-  const rsiBounceDown = rsi1mPrev > 75 && rsi1m < 70;
-  if (price>=bb5m.upper*0.998 && rsiBounceDown && volOK) {
-    return {
-      setup:"BB_REVERSION", direction:"SHORT",
-      entry:price, target:bb5m.mid,
-      stop: bb5m.upper + 0.3*atr5m, maxHoldMin:10,
-      reason:`BB short: price=${price.toFixed(5)} RSI drop ${rsi1mPrev.toFixed(1)}→${rsi1m.toFixed(1)} (was>75, now<70)`,
-    };
-  }
-  return null;
-}
-
-// ─── Setup 3: Volume Profile Liquidation ──────────────────────────────────────
-// 3× vol spike + RSI extreme → enter 0.1% beyond the move to catch reversal
-
-function detectVolumeLiquidation(m5, m1, atr5m) {
-  if (!atr5m) return null;
-  const lookback=48; // 4 hours of 5-min candles
-  const sliceV = m5.volumes.slice(-lookback);
-  const sliceH = m5.highs.slice(-lookback);
-  const sliceL = m5.lows.slice(-lookback);
-
-  // Highest-volume candle = key institutional level
-  const maxIdx  = sliceV.reduce((b,v,i)=>v>sliceV[b]?i:b,0);
-  const keyLvl  = (sliceH[maxIdx]+sliceL[maxIdx])/2;
-
-  const price   = m1.closes.at(-1);
-  const vma1m   = volmaVal(m1.volumes.slice(0,-1), VOL_MA);
-  const lastVol = m1.volumes.at(-1);
-  const rsi1m   = rsiVal(m1.closes, RSI_PERIOD);
-  if (!vma1m||rsi1m===null) return null;
-
-  const volSpike = lastVol > vma1m*3;  // 3× = liquidation event
-  const dist     = Math.abs(price-keyLvl)/keyLvl*100;
-
-  if (dist<0.3 && volSpike) {
-    if (price<keyLvl && rsi1m<20) {
-      // Enter 0.1% above the flush low (catch the reversal)
-      const entry = price*1.001;
-      return {
-        setup:"VOL_LIQUIDATION", direction:"LONG",
-        entry, target:entry+atr5m,
-        stop:  price-atr5m, maxHoldMin:8,
-        reason:`Vol liq LONG: key=${keyLvl.toFixed(5)} vol=${(lastVol/vma1m).toFixed(1)}x RSI=${rsi1m.toFixed(1)}`,
-      };
-    }
-    if (price>keyLvl && rsi1m>80) {
-      const entry = price*0.999;
-      return {
-        setup:"VOL_LIQUIDATION", direction:"SHORT",
-        entry, target:entry-atr5m,
-        stop:  price+atr5m, maxHoldMin:8,
-        reason:`Vol liq SHORT: key=${keyLvl.toFixed(5)} vol=${(lastVol/vma1m).toFixed(1)}x RSI=${rsi1m.toFixed(1)}`,
-      };
-    }
-  }
-  return null;
-}
-
-// ─── Setup 4: Macro Sentiment Flush ───────────────────────────────────────────
-// 1.5%+ sudden move → wait 30s → fade on RSI extreme (<20 / >80)
-// Stop: 1.5 ATR (wider for volatile moves, per strategy doc)
-
-function detectSentimentFlush(m1, atr5m, macro) {
-  if (!atr5m) return null;
-  const price   = m1.closes.at(-1);
-  const prev    = m1.closes.at(-2);
-  const movePct = (price-prev)/prev*100;
-
-  if (Math.abs(movePct) < 1.5) return null;  // raised from 1% to 1.5%
-
-  const flush = readJSON(FLUSH_FILE,{});
-  const now   = Date.now();
-
-  if (!flush.ts || now-flush.ts > 5*60*1000) {
-    writeJSON(FLUSH_FILE,{ts:now,movePct,price});
-    console.log(`  ⚡ Flush: ${movePct>=0?"+":""}${movePct.toFixed(2)}% — waiting 30s`);
+function getSignal({ price, vwap, ema8, rsi3val, pdh, pdl, btcAboveEma50, atrVal }) {
+  // All inputs must exist
+  if (!vwap || !ema8 || rsi3val === null || !pdh || !pdl || btcAboveEma50 === null || !atrVal) {
     return null;
   }
-  if (now-flush.ts < 30*1000) return null;
 
-  const rsi1m  = rsiVal(m1.closes, RSI_PERIOD);
-  if (rsi1m===null) return null;
+  const dist = Math.abs(price - vwap) / vwap;
+  if (dist > VWAP_BAND) return null;  // condition 4: within 1.5%
 
-  const dir = flush.movePct<0 ? "LONG" : "SHORT";
-  if (dir==="LONG"  && macro.bias==="SHORT") return null;
-  if (dir==="SHORT" && macro.bias==="LONG")  return null;
+  const stop   = 0.5 * atrVal;
+  const target = MIN_RR * stop;  // 1.0 ATR → R:R exactly 2.0
 
-  if (dir==="LONG" && rsi1m<20) {
-    delFile(FLUSH_FILE);
-    return {
-      setup:"SENTIMENT_FLUSH", direction:"LONG",
-      entry:price, target:price+atr5m,
-      stop: price-1.5*atr5m,  // wider stop: 1.5 ATR per strategy doc
-      maxHoldMin:5,
-      reason:`Flush LONG: move=${flush.movePct.toFixed(2)}% RSI=${rsi1m.toFixed(1)} waited=${((now-flush.ts)/1000).toFixed(0)}s`,
-    };
-  }
-  if (dir==="SHORT" && rsi1m>80) {
-    delFile(FLUSH_FILE);
-    return {
-      setup:"SENTIMENT_FLUSH", direction:"SHORT",
-      entry:price, target:price-atr5m,
-      stop: price+1.5*atr5m,
-      maxHoldMin:5,
-      reason:`Flush SHORT: move=${flush.movePct.toFixed(2)}% RSI=${rsi1m.toFixed(1)} waited=${((now-flush.ts)/1000).toFixed(0)}s`,
-    };
-  }
-  return null;
-}
-
-// ─── Setup 5: RSI Divergence ──────────────────────────────────────────────────
-// Works in MARKUP AND early CAPITULATION (not DISTRIBUTION — per strategy doc)
-// 1-min RSI must also fail to confirm (multi-TF divergence)
-
-function detectDivergence(m5, m1, atr5m, phase) {
-  if (!atr5m) return null;
-  // Only in MARKUP or CAPITULATION (strategy doc rule)
-  if (phase!=="MARKUP" && phase!=="CAPITULATION") return null;
-
-  const rsiArr5m = rsiArr(m5.closes, RSI_PERIOD);
-  const rsiArr1m = rsiArr(m1.closes, RSI_PERIOD);
-  if (rsiArr5m.length<12||rsiArr1m.length<12) return null;
-
-  const lb=6;
-  // 5-min divergence
-  const priceHH   = Math.max(...m5.highs.slice(-lb));
-  const pricePrev = Math.max(...m5.highs.slice(-(lb*2),-lb));
-  const rsiHH5m   = Math.max(...rsiArr5m.slice(-lb));
-  const rsiPrev5m = Math.max(...rsiArr5m.slice(-(lb*2),-lb));
-
-  // 1-min RSI also fails to confirm (doesn't break above prior 1-min RSI high)
-  const rsiHH1m   = Math.max(...rsiArr1m.slice(-lb));
-  const rsiPrev1m = Math.max(...rsiArr1m.slice(-(lb*2),-lb));
-  const rsi1mFails = rsiHH1m < rsiPrev1m;  // 1-min RSI not confirming the new high
-
-  const vma5m = volmaVal(m5.volumes.slice(0,-1), VOL_MA);
-  if (!vma5m) return null;
-
-  const price = m1.closes.at(-1);
-
+  // ── LONG: all 7 conditions ────────────────────────────────────────────────
   if (
-    priceHH > pricePrev*1.002 &&       // price: higher high
-    rsiHH5m < rsiPrev5m - 3 &&         // 5-min RSI: lower high
-    rsi1mFails &&                       // 1-min RSI also fails to confirm
-    m5.volumes.at(-1) < vma5m*0.85     // volume declining
+    price > vwap        &&   // 1. above VWAP
+    price > ema8        &&   // 2. above EMA(8)
+    rsi3val < 30        &&   // 3. RSI(3) oversold
+                             // 4. within 1.5% VWAP — already checked above
+    price > pdl         &&   // 5. above PDL
+    price < pdh         &&   // 6. below PDH
+    btcAboveEma50            // 7. BTC above EMA50 daily
   ) {
     return {
-      setup:"RSI_DIVERGENCE", direction:"SHORT",
-      entry:price,
-      target:Math.min(...m5.lows.slice(-lb)),
-      stop: priceHH+0.5*atr5m, maxHoldMin:12,
-      reason:`Bearish div: price ${pricePrev.toFixed(5)}→${priceHH.toFixed(5)} RSI5m ${rsiPrev5m.toFixed(1)}→${rsiHH5m.toFixed(1)} RSI1m fails=${rsi1mFails}`,
+      direction: "LONG",
+      entry:  price,
+      stop:   price - stop,
+      target: price + target,
     };
   }
-  return null;
-}
 
-// ─── Capitulation Flip Logic ──────────────────────────────────────────────────
-// Strategy: "Short the dump on first volume spike, cover and flip long on reversal volume"
-// We track the capitulation dump candle, then flip to long when reversal volume appears
-
-function detectCapitulationFlip(m1, atr5m) {
-  if (!atr5m) return null;
-  const capState = readJSON(CAP_FILE, {});
-  const now      = Date.now();
-  const price    = m1.closes.at(-1);
-  const vma1m    = volmaVal(m1.volumes.slice(0,-1), VOL_MA);
-  const lastVol  = m1.volumes.at(-1);
-  const rsi1m    = rsiVal(m1.closes, RSI_PERIOD);
-  if (!vma1m || rsi1m===null) return null;
-
-  const movePct  = (price - m1.closes.at(-2)) / m1.closes.at(-2) * 100;
-  const volSpike = lastVol > vma1m * 3;
-
-  // Step 1: Detect the dump (first volume spike down)
-  if (!capState.dumpTs && movePct < -1.5 && volSpike && rsi1m < 25) {
-    writeJSON(CAP_FILE, { dumpTs: now, dumpLow: price, dumpRSI: rsi1m });
-    console.log(`  🔴 Cap dump detected @ ${price.toFixed(5)} — waiting for reversal`);
-    // Return SHORT immediately on the dump
+  // ── SHORT: all 7 conditions ───────────────────────────────────────────────
+  if (
+    price < vwap        &&   // 1. below VWAP
+    price < ema8        &&   // 2. below EMA(8)
+    rsi3val > 70        &&   // 3. RSI(3) overbought
+                             // 4. within 1.5% VWAP — already checked above
+    price < pdh         &&   // 5. below PDH
+    price > pdl         &&   // 6. above PDL
+    !btcAboveEma50           // 7. BTC below EMA50 daily
+  ) {
     return {
-      setup:"CAP_FLIP_SHORT", direction:"SHORT",
-      entry: price,
-      target: price - atr5m,
-      stop:   price + atr5m,
-      maxHoldMin: 5,
-      reason: `Cap dump: ${movePct.toFixed(2)}% vol=${(lastVol/vma1m).toFixed(1)}x RSI=${rsi1m.toFixed(1)}`,
+      direction: "SHORT",
+      entry:  price,
+      stop:   price + stop,
+      target: price - target,
     };
   }
 
-  // Step 2: After dump, detect reversal volume → flip LONG
-  if (capState.dumpTs && now - capState.dumpTs > 60*1000 && now - capState.dumpTs < 2*60*60*1000) {
-    const recovered = price > capState.dumpLow * 1.005;  // price up 0.5% from dump low
-    const buyVolume = lastVol > vma1m * 2;
-    const rsiRecovering = rsi1m > (capState.dumpRSI || 20) + 5;
-
-    if (recovered && buyVolume && rsiRecovering) {
-      delFile(CAP_FILE);
-      return {
-        setup:"CAP_FLIP_LONG", direction:"LONG",
-        entry: price,
-        target: price + 1.5 * atr5m,
-        stop:   capState.dumpLow - 0.3 * atr5m,
-        maxHoldMin: 15,
-        reason: `Cap flip LONG: dump=${capState.dumpLow?.toFixed(5)} recovery vol=${(lastVol/vma1m).toFixed(1)}x RSI=${rsi1m.toFixed(1)}`,
-      };
-    }
-  }
-
-  // Expire cap state after 2 hours
-  if (capState.dumpTs && now - capState.dumpTs > 2*60*60*1000) {
-    delFile(CAP_FILE);
-    console.log("  ⏰ Cap flip state expired");
-  }
   return null;
 }
 
-// ─── Scale-In Logic ───────────────────────────────────────────────────────────
-// Strategy: "If target hit → close 50%, let 50% run. If price pulls back → add 2nd contract"
-// Add 2nd contract when price pulls back to entry after partial exit
+// ─── Open Position ────────────────────────────────────────────────────────────
 
-async function checkScaleIn(pos, price, atr5m, macro) {
-  const pos2 = loadPos2();
-  if (pos2) {
-    // Manage 2nd position same way as first
-    await managePosition2(pos2, price);
-    return;
-  }
-
-  // Only scale in if: first position is scaled (took 50% profit) + price pulls back to entry
-  if (!pos.scaled) return;
-  if (pos.direction !== "LONG") return;  // scale-in only for longs per strategy doc
-
-  const pullbackLevel = pos.entry * 1.001;  // pulled back to near entry
-  const vma1m = volmaVal ? null : null;      // we'll use ATR proximity check
-
-  const nearEntry = Math.abs(price - pos.entry) / pos.entry < 0.003;  // within 0.3% of entry
-  if (!nearEntry) return;
-
-  // Add 2nd contract at this pullback
-  const riskUSD  = ACCOUNT_USD * (RISK_PCT/100);
-  const dist     = Math.abs(pos.entry - pos.stop);
-  const sizeUSD2 = Math.min(dist>0 ? riskUSD/dist*price : 0, MAX_TRADE_USD);
-
-  const pos2Data = {
-    symbol: SYMBOL, direction: pos.direction,
-    setup: pos.setup + "_SCALE",
-    entry: price,
-    target: pos.target,
-    stop:   pos.stop,
-    maxHoldMin: pos.maxHoldMin,
-    sizeUSD: sizeUSD2,
-    entryTime: Date.now(),
-    phase: macro.phase,
-    confluence: pos.confluence,
-    reason: `Scale-in at pullback to ${price.toFixed(5)} (original entry ${pos.entry.toFixed(5)})`,
-    scaled: false,
-  };
-  savePos2(pos2Data);
-  console.log(`  ➕ SCALE-IN 2nd contract @ ${price.toFixed(5)} $${sizeUSD2.toFixed(2)}`);
-  await notify("[PAPER] Scale-In 2nd Contract",
-    `Added 2nd position @ ${price.toFixed(5)}\nSame target/stop as first trade\nPhase: ${macro.phase}`, "default");
-}
-
-async function managePosition2(pos, price) {
-  const ageMin = (Date.now()-pos.entryTime)/60000;
-  const pnlPct = pos.direction==="LONG"
-    ? (price-pos.entry)/pos.entry*100
-    : (pos.entry-price)/pos.entry*100;
-
-  let closeReason=null;
-  if (pos.direction==="LONG") {
-    if (price>=pos.target) closeReason="TARGET_HIT";
-    if (price<=pos.stop)   closeReason="STOP_HIT";
-  } else {
-    if (price<=pos.target) closeReason="TARGET_HIT";
-    if (price>=pos.stop)   closeReason="STOP_HIT";
-  }
-  if (ageMin>=pos.maxHoldMin) closeReason="TIME_LIMIT";
-  if (!closeReason) return;
-
-  const pnlUSD = (pnlPct/100)*pos.sizeUSD;
-  const daily  = loadDaily();
-  daily.pnlUSD+=pnlUSD; daily.trades++; if(pnlUSD>0) daily.wins++;
-  saveDaily(daily); savePos2(null);
-  console.log(`  ${pnlUSD>0?"✅":"❌"} CLOSED 2nd contract ${pos.direction} | ${closeReason} | ${pnlUSD>=0?"+":""}$${pnlUSD.toFixed(3)}`);
-  await logToSheet({
-    Date:new Date().toISOString().slice(0,10), Time:new Date().toISOString().slice(11,19),
-    Symbol:SYMBOL, Side:pos.direction==="LONG"?"BUY":"SELL", Setup:pos.setup,
-    "Entry ($)":pos.entry, "Exit ($)":price, "Size ($)":pos.sizeUSD.toFixed(2),
-    "P&L ($)":pnlUSD.toFixed(3), "P&L %":pnlPct.toFixed(3),
-    "Close Reason":closeReason, "Hold Min":ageMin.toFixed(1),
-    Phase:pos.phase, Confluence:"scale-in", Mode:PAPER_TRADING?"PAPER":"LIVE",
-  });
-}
-
-// ─── Position Management ──────────────────────────────────────────────────────
-
-const loadPos    = ()  => readJSON(POSITION_FILE,null);
-const savePos    = p   => p===null ? delFile(POSITION_FILE) : writeJSON(POSITION_FILE,p);
-const loadPos2   = ()  => readJSON(POSITION2_FILE,null);
-const savePos2   = p   => p===null ? delFile(POSITION2_FILE) : writeJSON(POSITION2_FILE,p);
-const loadDaily  = () => {
-  const today=new Date().toISOString().slice(0,10);
-  const d=readJSON(DAILY_FILE,{});
-  return d.date===today ? d : {date:today,pnlUSD:0,trades:0,wins:0};
-};
-const saveDaily = d => writeJSON(DAILY_FILE,d);
-
-async function managePosition(pos, price) {
-  const ageMin = (Date.now()-pos.entryTime)/60000;
-  const pnlPct = pos.direction==="LONG"
-    ? (price-pos.entry)/pos.entry*100
-    : (pos.entry-price)/pos.entry*100;
-
-  // ── Partial scale-out: at 50% of target, close 50% and trail stop ──
-  if (!pos.scaled && pos.target2) {
-    const halfTarget = pos.entry + (pos.target-pos.entry)*0.5;
-    const reachedHalf = pos.direction==="LONG" ? price>=halfTarget : price<=halfTarget;
-    if (reachedHalf) {
-      console.log(`  📤 PARTIAL EXIT 50% at ${price.toFixed(5)} — locking profit, trailing rest`);
-      pos.scaled   = true;
-      pos.sizeUSD  = pos.sizeUSD*0.5;
-      pos.stop     = pos.entry;  // move stop to breakeven for remaining 50%
-      savePos(pos);
-      await notify("[PAPER] Partial Exit 50%", `${pos.setup} ${pos.direction}: took 50% profit at ${price.toFixed(5)}, trailing rest`,"default");
-    }
-  }
-
-  let closeReason=null;
-  if (pos.direction==="LONG") {
-    if (price>=pos.target) closeReason="TARGET_HIT";
-    if (price<=pos.stop)   closeReason="STOP_HIT";
-  } else {
-    if (price<=pos.target) closeReason="TARGET_HIT";
-    if (price>=pos.stop)   closeReason="STOP_HIT";
-  }
-  if (ageMin>=pos.maxHoldMin) closeReason="TIME_LIMIT";
-
-  if (!closeReason) {
-    console.log(`  📌 ${pos.direction} ${pos.setup} | P&L ${pnlPct>=0?"+":""}${pnlPct.toFixed(3)}% | ${ageMin.toFixed(1)}min | T=${pos.target.toFixed(5)} S=${pos.stop.toFixed(5)}${pos.scaled?" [scaled]":""}`);
-    return false;
-  }
-
-  const pnlUSD = (pnlPct/100)*pos.sizeUSD;
-  const daily  = loadDaily();
-  daily.pnlUSD+=pnlUSD; daily.trades++; if(pnlUSD>0) daily.wins++;
-  saveDaily(daily); savePos(null);
-
-  const emoji=pnlUSD>0?"✅":"❌";
-  console.log(`  ${emoji} CLOSED ${pos.direction} ${pos.setup} | ${closeReason} | ${pnlUSD>=0?"+":""}$${pnlUSD.toFixed(3)} (${pnlPct>=0?"+":""}${pnlPct.toFixed(3)}%)`);
-  console.log(`  📅 Daily: ${daily.pnlUSD>=0?"+":""}$${daily.pnlUSD.toFixed(3)} | ${daily.wins}W/${daily.trades-daily.wins}L`);
-
-  const tag=PAPER_TRADING?"[PAPER] ":"";
-  await notify(
-    `${tag}Scalp ${closeReason==="TARGET_HIT"?"✅ Win":"❌ Loss"} — ${pos.setup}`,
-    `${pos.direction} ${SYMBOL}\nEntry: ${pos.entry.toFixed(5)} → Exit: ${price.toFixed(5)}\nP&L: ${pnlUSD>=0?"+":""}$${pnlUSD.toFixed(3)} (${pnlPct>=0?"+":""}${pnlPct.toFixed(3)}%)\n${closeReason} | ${ageMin.toFixed(1)}min\nDaily: ${daily.pnlUSD>=0?"+":""}$${daily.pnlUSD.toFixed(3)} | ${daily.wins}W/${daily.trades-daily.wins}L`,
-    pnlUSD>0?"high":"default"
-  );
-  await logToSheet({
-    Date:new Date().toISOString().slice(0,10), Time:new Date().toISOString().slice(11,19),
-    Symbol:SYMBOL, Side:pos.direction==="LONG"?"BUY":"SELL", Setup:pos.setup,
-    "Entry ($)":pos.entry, "Exit ($)":price, "Size ($)":pos.sizeUSD.toFixed(2),
-    "P&L ($)":pnlUSD.toFixed(3), "P&L %":pnlPct.toFixed(3),
-    "Close Reason":closeReason, "Hold Min":ageMin.toFixed(1),
-    Phase:pos.phase, Confluence:pos.confluence, Scaled:pos.scaled||false,
-    Mode:PAPER_TRADING?"PAPER":"LIVE",
-  });
-  return true;
-}
-
-async function openPosition(setup, macro, conf) {
-  const {direction,entry,target,stop,maxHoldMin,reason,setup:name,target2} = setup;
-  const riskUSD = ACCOUNT_USD*(RISK_PCT/100);
-  const dist    = Math.abs(entry-stop);
-  const sizeUSD = Math.min(dist>0?riskUSD/dist*entry:0, MAX_TRADE_USD);
-  const rr      = Math.abs(target-entry)/Math.abs(entry-stop);
+async function openPosition(signal, indicators) {
+  const { direction, entry, stop, target } = signal;
+  const dist    = Math.abs(entry - stop);
+  const riskUSD = ACCOUNT_USD * (RISK_PCT / 100);
+  const sizeUSD = Math.min(dist > 0 ? (riskUSD / dist) * entry : MAX_TRADE_USD, MAX_TRADE_USD);
+  const rr      = Math.abs(target - entry) / Math.abs(entry - stop);
 
   if (rr < MIN_RR) {
-    console.log(`  ⚠️  ${name} R/R=${rr.toFixed(2)} < ${MIN_RR} — skip`);
+    console.log(`  ⚠️  R:R ${rr.toFixed(2)} < ${MIN_RR} — skip`);
     return;
   }
 
-  savePos({symbol:SYMBOL,direction,setup:name,entry,target,target2,stop,
-    maxHoldMin,sizeUSD,entryTime:Date.now(),phase:macro.phase,confluence:conf,reason,scaled:false});
+  const pos = {
+    symbol: SYMBOL, direction, entry, stop, target,
+    sizeUSD, entryTime: Date.now(), scaled: false,
+  };
+  savePos(pos);
 
-  const tPct=(Math.abs(target-entry)/entry*100).toFixed(2);
-  const sPct=(Math.abs(stop-entry)/entry*100).toFixed(2);
-  const tag=PAPER_TRADING?"[PAPER] ":"";
+  const tPct = (Math.abs(target - entry) / entry * 100).toFixed(3);
+  const sPct = (Math.abs(stop   - entry) / entry * 100).toFixed(3);
+  const tag  = PAPER ? "[PAPER] " : "";
 
-  console.log(`  🚀 ENTER ${direction} ${name} @ ${entry.toFixed(5)} | T+${tPct}% S-${sPct}% R/R ${rr.toFixed(2)} $${sizeUSD.toFixed(2)} Conf=${conf}/3`);
-  console.log(`     ${reason}`);
+  console.log(`  🟢 OPEN ${direction} @ ${entry.toFixed(5)}`);
+  console.log(`     Target: ${target.toFixed(5)} (+${tPct}%)  Stop: ${stop.toFixed(5)} (-${sPct}%)  Size: $${sizeUSD.toFixed(2)}  R:R ${rr.toFixed(1)}`);
+  console.log(`     VWAP=${indicators.vwap?.toFixed(5)} EMA8=${indicators.ema8?.toFixed(5)} RSI3=${indicators.rsi3val?.toFixed(1)}`);
 
   await notify(
-    `${tag}New Scalp — ${name} ${direction}`,
-    `${direction} ${SYMBOL} @ ${entry.toFixed(5)}\nTarget: +${tPct}% | Stop: -${sPct}%\nR/R: ${rr.toFixed(2)} | $${sizeUSD.toFixed(2)} | Conf: ${conf}/3\nPhase: ${macro.phase}`,
+    `${tag}${direction} ${SYMBOL}`,
+    `Entry:  ${entry.toFixed(5)}\nTarget: ${target.toFixed(5)} (+${tPct}%)\nStop:   ${stop.toFixed(5)} (-${sPct}%)\nSize:   $${sizeUSD.toFixed(2)} | R:R ${rr.toFixed(1)}\nRSI3=${indicators.rsi3val?.toFixed(1)} VWAP=${indicators.vwap?.toFixed(5)}`,
     "high"
   );
+
+  await logToSheet({
+    date: new Date().toISOString(), type: "OPEN",
+    symbol: SYMBOL, direction, entry, stop, target,
+    sizeUSD: sizeUSD.toFixed(2), rr: rr.toFixed(2), paper: PAPER,
+  });
+}
+
+// ─── Manage Open Position ─────────────────────────────────────────────────────
+
+async function managePosition(pos, price) {
+  const ageMin = (Date.now() - pos.entryTime) / 60000;
+  const pnlPct = pos.direction === "LONG"
+    ? (price - pos.entry) / pos.entry * 100
+    : (pos.entry - price) / pos.entry * 100;
+
+  // Partial scale-out: at 50% of target distance, close 50% and move stop to breakeven
+  if (!pos.scaled) {
+    const halfDist  = Math.abs(pos.target - pos.entry) * 0.5;
+    const halfLevel = pos.direction === "LONG" ? pos.entry + halfDist : pos.entry - halfDist;
+    const reached   = pos.direction === "LONG" ? price >= halfLevel : price <= halfLevel;
+
+    if (reached) {
+      pos.scaled  = true;
+      pos.sizeUSD = pos.sizeUSD * 0.5;   // only half remaining
+      pos.stop    = pos.entry;            // stop moved to breakeven
+      savePos(pos);
+      const halfPnl = (halfDist / pos.entry * 100).toFixed(3);
+      console.log(`  📤 PARTIAL EXIT 50% @ ${price.toFixed(5)} (+${halfPnl}%) — stop → breakeven`);
+      await notify(
+        `${PAPER ? "[PAPER] " : ""}Partial Exit`,
+        `${pos.direction} ${SYMBOL} — took 50% profit @ ${price.toFixed(5)}\n+${halfPnl}% | Remaining half now risk-free`
+      );
+    }
+  }
+
+  // Check exit conditions
+  let reason = null;
+  if (pos.direction === "LONG") {
+    if (price >= pos.target) reason = "TARGET_HIT";
+    if (price <= pos.stop)   reason = "STOP_HIT";
+  } else {
+    if (price <= pos.target) reason = "TARGET_HIT";
+    if (price >= pos.stop)   reason = "STOP_HIT";
+  }
+  if (ageMin >= MAX_HOLD_MIN) reason = "TIME_STOP";
+
+  // Still open — just log status
+  if (!reason) {
+    const emoji = pnlPct >= 0 ? "📈" : "📉";
+    console.log(`  ${emoji} ${pos.direction} | P&L ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(3)}% | Age ${ageMin.toFixed(1)}min | T=${pos.target.toFixed(5)} S=${pos.stop.toFixed(5)}${pos.scaled ? " ✂️" : ""}`);
+    return;
+  }
+
+  // Close position
+  const pnlUSD = (pnlPct / 100) * pos.sizeUSD;
+  const daily  = loadDaily();
+  daily.pnlUSD += pnlUSD;
+  daily.trades++;
+  if (pnlPct > 0) daily.wins++;
+  saveDaily(daily);
+  delFile(POS_FILE);
+
+  const emoji = reason === "TARGET_HIT" ? "✅" : reason === "STOP_HIT" ? "🛑" : "⏱️";
+  const tag   = PAPER ? "[PAPER] " : "";
+  console.log(`  ${emoji} CLOSE ${reason} | ${pos.direction} | ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(3)}% | $${pnlUSD >= 0 ? "+" : ""}${pnlUSD.toFixed(2)} | Day: $${daily.pnlUSD.toFixed(2)} (${daily.wins}W/${daily.trades}T)`);
+
+  await notify(
+    `${tag}${emoji} ${reason}`,
+    `${pos.direction} ${SYMBOL}\nEntry: ${pos.entry.toFixed(5)} → Exit: ${price.toFixed(5)}\nP&L: ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(3)}% ($${pnlUSD >= 0 ? "+" : ""}${pnlUSD.toFixed(2)})\nDay: $${daily.pnlUSD.toFixed(2)} | ${daily.wins}W / ${daily.trades}T`,
+    reason === "TARGET_HIT" ? "high" : "default"
+  );
+
+  await logToSheet({
+    date: new Date().toISOString(), type: "CLOSE",
+    symbol: SYMBOL, direction: pos.direction,
+    entry: pos.entry, exit: price,
+    pnlPct: pnlPct.toFixed(3), pnlUSD: pnlUSD.toFixed(2),
+    reason, dayPnl: daily.pnlUSD.toFixed(2), paper: PAPER,
+  });
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-async function run() {
-  const t=new Date().toISOString().replace("T"," ").slice(0,19);
-  console.log(`\n⚡ BCB Scalper — ${t} UTC [${PAPER_TRADING?"PAPER":"LIVE"}]`);
+async function main() {
+  const ts = new Date().toISOString().replace("T", " ").slice(0, 19);
+  console.log(`\n⚡ VWAP Scalper — ${ts} UTC ${PAPER ? "[PAPER]" : "[LIVE]"}`);
 
-  // 1. Daily loss / trade guards
-  const daily=loadDaily();
-  if (daily.pnlUSD <= -(ACCOUNT_USD*(MAX_DAILY_LOSS/100))) {
-    console.log(`  🛑 Daily loss limit reached. Done for today.`); return;
+  // ── Daily limits ──────────────────────────────────────────────────────────
+  const daily       = loadDaily();
+  const maxLossUSD  = ACCOUNT_USD * (MAX_DAILY_LOSS / 100);
+  if (daily.pnlUSD <= -maxLossUSD) {
+    console.log(`  🛑 Daily loss limit: $${daily.pnlUSD.toFixed(2)} ≤ -$${maxLossUSD.toFixed(2)} — flat for today`);
+    return;
   }
   if (daily.trades >= MAX_TRADES_DAY) {
-    console.log(`  🛑 Max ${MAX_TRADES_DAY} trades/day.`); return;
-  }
-  console.log(`  📅 Daily: ${daily.pnlUSD>=0?"+":""}$${daily.pnlUSD.toFixed(3)} | ${daily.trades}T | ${daily.wins}W`);
-
-  // 2. Hours filter — still manage open positions outside best hours
-  if (!isGoodHour()) {
-    console.log(`  🕐 Hour ${new Date().getUTCHours()} UTC not in [1-4,8-11,18-20]. No new trades.`);
-    const p=loadPos();
-    if (p) { const m1=await fetchOHLCV(SYMBOL,"1m",5); if(m1) await managePosition(p,m1.closes.at(-1)); }
+    console.log(`  🛑 Max trades hit: ${daily.trades}/${MAX_TRADES_DAY} — done for today`);
     return;
   }
 
-  // 3. Macro bias
-  const macro=await getMacro();
-  if (macro.phase==="NEUTRAL"||macro.bias==="NONE") {
-    console.log("  ⏸️  No macro phase."); return;
-  }
-
-  // 4. Phase-specific trade limits
-  if (macro.phase==="ACCUMULATION" && daily.trades>=2) {
-    console.log("  ⏸️  Accumulation: 2/day cap."); return;
-  }
-  if (macro.phase==="DISTRIBUTION" && daily.trades>=2) {
-    console.log("  ⏸️  Distribution: scalp small, 2/day cap."); return;
-  }
-
-  // 5. Multi-timeframe data
-  const [m15,m5,m1] = await Promise.all([
-    fetchOHLCV(SYMBOL,"15m",100),
-    fetchOHLCV(SYMBOL,"5m",100),
-    fetchOHLCV(SYMBOL,"1m",100),
+  // ── Fetch data ────────────────────────────────────────────────────────────
+  const [xrp1m, xrpDaily, btcDaily] = await Promise.all([
+    fetchOHLCV(SYMBOL,     "1m",  1000),  // 1000 1m bars (~16.7h) for VWAP + indicators
+    fetchOHLCV(SYMBOL,     "1d",  3),     // PDH / PDL
+    fetchOHLCV(BTC_SYMBOL, "1d",  60),    // BTC EMA(50) daily
   ]);
-  if (!m5||!m1) { console.log("  ⚠️  Data unavailable."); return; }
 
-  const price  = m1.closes.at(-1);
-  const atr5m  = atrVal(m5.highs,m5.lows,m5.closes,ATR_PERIOD);
-  const r1m    = rsiVal(m1.closes, RSI_PERIOD);
-  const r5m    = rsiVal(m5.closes, RSI_PERIOD);
-  const r15m   = m15 ? rsiVal(m15.closes, RSI_PERIOD) : null;
-  const bb5m   = bbVal(m5.closes, BB_PERIOD, BB_STD);
-
-  console.log(`  💹 ${SYMBOL} @ $${price.toFixed(5)} | ATR5m=${atr5m?.toFixed(5)}`);
-  console.log(`  📊 RSI: 1m=${r1m?.toFixed(1)} 5m=${r5m?.toFixed(1)} 15m=${r15m?.toFixed(1)}`);
-  if (bb5m) {
-    const loc=price<bb5m.lower?"BELOW↓":price>bb5m.upper?"ABOVE↑":"inside";
-    console.log(`  📐 BB5m: ${bb5m.lower.toFixed(5)}/${bb5m.mid.toFixed(5)}/${bb5m.upper.toFixed(5)} [${loc}]`);
-  }
-
-  // 6. Manage open position(s) first
-  const openPos=loadPos();
-  if (openPos) {
-    await managePosition(openPos, price);
-    await checkScaleIn(openPos, price, atr5m, macro);  // scale-in 2nd contract if eligible
+  if (!xrp1m || !xrpDaily || !btcDaily) {
+    console.log("  ❌ Data fetch failed");
     return;
   }
 
-  // 7. Scan setups, filter by bias
-  const canL = macro.bias==="LONG" ||macro.bias==="BOTH";
-  const canS = macro.bias==="SHORT"||macro.bias==="BOTH";
+  // ── Calculate indicators ──────────────────────────────────────────────────
+  const price        = xrp1m.closes.at(-1);
+  const vwap         = calcVWAP(xrp1m);
+  const ema8         = ema(xrp1m.closes, 8);
+  const rsi3val      = rsi(xrp1m.closes, 3);
+  const atrVal       = atr(xrp1m.highs, xrp1m.lows, xrp1m.closes, 14);
+  const btcEma50     = ema(btcDaily.closes, 50);
+  const btcNow       = btcDaily.closes.at(-1);
+  const btcAboveEma50 = btcEma50 !== null ? btcNow > btcEma50 : null;
 
-  const candidates = [
-    detectSpring(m5,m1,atr5m),
-    detectBBReversion(m5,m1,atr5m),
-    detectVolumeLiquidation(m5,m1,atr5m),
-    detectSentimentFlush(m1,atr5m,macro),
-    detectDivergence(m5,m1,atr5m,macro.phase),
-    // Capitulation flip — only in CAPITULATION phase
-    macro.phase==="CAPITULATION" ? detectCapitulationFlip(m1,atr5m) : null,
-  ]
-    .filter(Boolean)
-    .filter(s=>(s.direction==="LONG"&&canL)||(s.direction==="SHORT"&&canS));
+  // PDH / PDL from yesterday
+  const yi  = xrpDaily.closes.length - 2;  // index of yesterday
+  const pdh = yi >= 0 ? xrpDaily.highs[yi]  : null;
+  const pdl = yi >= 0 ? xrpDaily.lows[yi]   : null;
 
-  if (candidates.length===0) {
-    const loc=bb5m?(price<bb5m.lower?"below":price>bb5m.upper?"above":`inside ${((price-bb5m.lower)/(bb5m.upper-bb5m.lower)*100).toFixed(0)}%`):"n/a";
-    console.log(`  💤 No setups. Bias=${macro.bias} BB:${loc}`); return;
+  // ── Status log ────────────────────────────────────────────────────────────
+  const vwapDist = vwap ? ((price - vwap) / vwap * 100).toFixed(3) : "N/A";
+  const btcTag   = btcAboveEma50 ? "✅ BULL" : "❌ BEAR";
+  console.log(`  Price=${price.toFixed(5)}  VWAP=${vwap?.toFixed(5)} (${vwapDist}%)  EMA8=${ema8?.toFixed(5)}  RSI3=${rsi3val?.toFixed(1)}`);
+  console.log(`  PDH=${pdh?.toFixed(5)}  PDL=${pdl?.toFixed(5)}  BTC/EMA50=${btcTag}  ATR=${atrVal?.toFixed(5)}`);
+
+  // ── Manage existing position ───────────────────────────────────────────────
+  const pos = loadPos();
+  if (pos) {
+    await managePosition(pos, price);
+    return;  // one position at a time
   }
 
-  // 8. Score by confluence, pick best, require ≥1
-  const scored = candidates
-    .map(s=>({...s,conf:confluence(r1m,r5m,r15m,s.direction)}))
-    .sort((a,b)=>b.conf-a.conf);
+  // ── Look for entry ────────────────────────────────────────────────────────
+  const indicators = { vwap, ema8, rsi3val, pdh, pdl, btcAboveEma50, atrVal };
+  const signal     = getSignal({ price, ...indicators });
 
-  console.log(`  🎯 ${scored.length} setup(s): ${scored.map(s=>`${s.setup}(${s.direction},conf=${s.conf})`).join(", ")}`);
+  if (signal) {
+    await openPosition(signal, indicators);
+  } else {
+    // Show which conditions passed / failed for transparency
+    const vwapBias = price > (vwap || price) ? "above" : "below";
+    const emaBias  = price > (ema8  || price) ? "above" : "below";
+    const rsiStr   = rsi3val !== null ? rsi3val.toFixed(1) : "N/A";
+    const rsiTag   = rsi3val !== null
+      ? (rsi3val < 30 ? "✅ <30" : rsi3val > 70 ? "✅ >70" : `❌ neutral (${rsiStr})`)
+      : "❌ null";
 
-  const best=scored[0];
-  if (best.conf<1) {
-    console.log(`  ⚠️  Confluence=${best.conf}/3 — need at least 1 timeframe. Waiting.`); return;
+    console.log(`  ⏸️  No signal | VWAP:${vwapBias} EMA8:${emaBias} RSI3:${rsiTag} BTC:${btcTag} Dist:${vwapDist}%`);
   }
-
-  await openPosition(best, macro, best.conf);
 }
 
-run().catch(e=>{console.error("❌ Fatal:",e.message);process.exit(1);});
+main().catch(e => console.error("ERROR:", e.message));
